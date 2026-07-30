@@ -6,8 +6,8 @@
 /* 初始化 JPEG 编码器 */
 int jpeg_init(void);
 
-/* 将 RGB888 帧编码为 JPEG，结果存入 g_state.jpeg_buf/size */
-int jpeg_encode_frame(const uint8_t *rgb_data);
+/* 将 RGB888 帧编码为 JPEG，结果存入 g_state.jpeg_buf/size。仅由 JPEG worker 调用。 */
+int jpeg_encode_frame(const uint8_t *rgb_data, unsigned int frame_seq);
 
 /* 关闭编码器 */
 void jpeg_close(void);

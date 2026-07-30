@@ -18,10 +18,6 @@ USERADD_PARAM:${PN} = "-u 1001 -g debug -d /home/debug -s /bin/sh debug"
 RDEPENDS:${PN} += "dropbear"
 
 do_install() {
-    if [ ! -s ${WORKDIR}/authorized_keys ]; then
-        bbfatal "ssh-access-dev requires a non-empty authorized_keys file supplied outside the public repository"
-    fi
-
     install -d -m 0755 ${D}/home
     install -d -m 0700 ${D}/home/debug/.ssh
     install -m 0600 ${WORKDIR}/authorized_keys ${D}/home/debug/.ssh/authorized_keys

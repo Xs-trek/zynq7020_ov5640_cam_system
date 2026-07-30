@@ -30,6 +30,7 @@ WebSocket 不负责启动或停止 `cam_system`，也不改变 REST API 的控�
 检测状态消息保持既有 JSON 语义：
 
 - 必含 `status`。
+- 必含 `frame_seq`，表示本条检测快照的源采集帧；可与 MJPEG `X-Frame-Seq` 对齐。
 - 必含 `detections`。
 - tracking 有预测框时可含 `predicted_target`。
 - 关闭 YOLO 后必须发布 `detections: []`，用于前端清框。

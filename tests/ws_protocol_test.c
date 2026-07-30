@@ -235,6 +235,19 @@ static void test_server_headers(void)
                                          &header_len), -1);
 }
 
+static void test_detection_frame_sequence_metadata(void)
+{
+    char metadata[32];
+    char too_small[8];
+
+    EXPECT_EQ(cam_ws_format_detection_frame_seq(metadata, sizeof(metadata),
+                                                 UINT32_MAX), 22);
+    EXPECT_TRUE(strcmp(metadata, "\"frame_seq\":4294967295") == 0);
+    EXPECT_EQ(cam_ws_format_detection_frame_seq(too_small, sizeof(too_small),
+                                                 1U), -1);
+    EXPECT_EQ(cam_ws_format_detection_frame_seq(NULL, 0U, 1U), -1);
+}
+
 int main(void)
 {
     test_masked_short_text();
@@ -243,6 +256,7 @@ int main(void)
     test_incomplete_frame();
     test_rejected_client_frames();
     test_server_headers();
+    test_detection_frame_sequence_metadata();
 
     if (failures != 0) {
         fprintf(stderr, "ws_protocol_test: %d failure(s)\n", failures);

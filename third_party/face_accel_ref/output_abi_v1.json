@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "status": "FROZEN",
+  "model_id": "ultraface_rfb_320_s8s8_minmax",
+  "endianness": "little",
+  "buffer_alignment_bytes": 64,
+  "minimum_buffer_capacity_bytes": 26752,
+  "out_len_bytes": 26704,
+  "header": {
+    "offset_bytes": 0,
+    "size_bytes": 16,
+    "fields": [
+      {"name": "magic", "type": "uint32", "value_hex": "0xFACE0D01"},
+      {"name": "frame_id", "type": "uint32", "value": "copied from FA_FRAME_ID"},
+      {"name": "tensor_count", "type": "uint32", "value": 2},
+      {"name": "total_len", "type": "uint32", "value": 26704}
+    ]
+  },
+  "descriptor_table": {
+    "offset_bytes": 16,
+    "descriptor_size_bytes": 32,
+    "count": 2,
+    "reserved_zero_fill": {"offset_bytes": 80, "size_bytes": 48}
+  },
+  "tensors": [
+    {
+      "tensor_id": 0,
+      "name": "scores_logits",
+      "descriptor_offset_bytes": 16,
+      "data_offset_bytes": 128,
+      "data_length_bytes": 8840,
+      "dtype_code": 0,
+      "dtype": "int8",
+      "shape_dims": [1, 4420, 2, 0],
+      "logical_layout": "NLC; prior-major, class logits [background, face]",
+      "scale": 0.06540081650018692,
+      "zero_point": 0,
+      "real_value": "int8_code * scale"
+    },
+    {
+      "tensor_id": 1,
+      "name": "boxes_locations",
+      "descriptor_offset_bytes": 48,
+      "data_offset_bytes": 9024,
+      "data_length_bytes": 17680,
+      "dtype_code": 0,
+      "dtype": "int8",
+      "shape_dims": [1, 4420, 4, 0],
+      "logical_layout": "NLC; prior-major [delta_cx, delta_cy, delta_w, delta_h]",
+      "scale": 0.062080398201942444,
+      "zero_point": 0,
+      "real_value": "int8_code * scale"
+    }
+  ],
+  "priors": {
+    "input_width": 320,
+    "input_height": 240,
+    "strides": [8, 16, 32, 64],
+    "min_boxes_per_level": [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]],
+    "feature_grid_rule": "ceil(input_dimension / stride)",
+    "iteration_order": "level, row, column, min_box",
+    "center": "[(column+0.5)/feature_width, (row+0.5)/feature_height]",
+    "size": "[min_box/320, min_box/240]",
+    "variance_center": 0.1,
+    "variance_size": 0.2,
+    "count": 4420
+  },
+  "ps_postprocess": {
+    "softmax_axis": "class axis of scores_logits",
+    "candidate_order": "face confidence descending, prior index ascending",
+    "candidate_limit": 200,
+    "nms_iou": "non-inclusive xyxy area, epsilon 1e-6",
+    "default_score_threshold": 0.7,
+    "default_nms_threshold": 0.3,
+    "output": "bbox[x,y,w,h] clipped and normalized to RGB24 640x480, confidence, class_id=0(face)"
+  }
+}

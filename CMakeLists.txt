@@ -21,19 +21,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(CAM_SYSTEM_ENABLE_WARNINGS "Enable project warning flags" ON)
 set(CAM_SYSTEM_DEPENDENCY_MODE "EXTERNAL" CACHE STRING
-    "Dependency mode: EXTERNAL uses historical ARM install paths, YOCTO uses recipe sysroot packages")
+    "Dependency mode: EXTERNAL uses SDK install paths, YOCTO uses recipe sysroot packages")
 set_property(CACHE CAM_SYSTEM_DEPENDENCY_MODE PROPERTY STRINGS EXTERNAL YOCTO)
 
 set(CAM_SYSTEM_NCNN_ROOT "$ENV{HOME}/ncnn/build-arm/install"
     CACHE PATH "ncnn ARM install prefix")
 set(CAM_SYSTEM_JPEGTURBO_ROOT "$ENV{HOME}/workdir/libjpeg-turbo/build-arm/install"
     CACHE PATH "libjpeg-turbo ARM install prefix")
-set(CAM_SYSTEM_OPENCV_ROOT "${CMAKE_SOURCE_DIR}/third_party/opencv"
-    CACHE PATH "OpenCV ARM install prefix")
-
-set(OpenCV_DIR "${CAM_SYSTEM_OPENCV_ROOT}/lib/cmake/opencv4"
-    CACHE PATH "OpenCV CMake package directory")
-
 set(CAM_SYSTEM_NCNN_LIBRARY "${CAM_SYSTEM_NCNN_ROOT}/lib/libncnn.a"
     CACHE FILEPATH "ncnn library")
 set(CAM_SYSTEM_TURBOJPEG_LIBRARY "${CAM_SYSTEM_JPEGTURBO_ROOT}/lib/libturbojpeg.so"
@@ -52,10 +46,6 @@ if(CAM_SYSTEM_DEPENDENCY_MODE STREQUAL "EXTERNAL")
     cam_system_require_path("${CAM_SYSTEM_NCNN_LIBRARY}" "ncnn library")
     cam_system_require_path("${CAM_SYSTEM_JPEGTURBO_ROOT}/include" "libjpeg-turbo include directory")
     cam_system_require_path("${CAM_SYSTEM_TURBOJPEG_LIBRARY}" "TurboJPEG library")
-    cam_system_require_path("${OpenCV_DIR}/OpenCVConfig.cmake" "OpenCVConfig.cmake")
-
-    find_package(OpenCV REQUIRED CONFIG)
-
     add_library(ncnn::ncnn STATIC IMPORTED)
     set_target_properties(ncnn::ncnn PROPERTIES
         IMPORTED_LOCATION "${CAM_SYSTEM_NCNN_LIBRARY}"
@@ -71,37 +61,6 @@ if(CAM_SYSTEM_DEPENDENCY_MODE STREQUAL "EXTERNAL")
     set(CAM_SYSTEM_NCNN_TARGET ncnn::ncnn)
     set(CAM_SYSTEM_TURBOJPEG_TARGET TurboJPEG::turbojpeg)
 elseif(CAM_SYSTEM_DEPENDENCY_MODE STREQUAL "YOCTO")
-    find_path(CAM_SYSTEM_YOCTO_OPENCV_INCLUDE_DIR
-        NAMES opencv2/core.hpp
-        PATH_SUFFIXES include/opencv4)
-    find_library(CAM_SYSTEM_YOCTO_OPENCV_VIDEO_LIBRARY
-        NAMES opencv_video)
-    find_library(CAM_SYSTEM_YOCTO_OPENCV_IMGPROC_LIBRARY
-        NAMES opencv_imgproc)
-    find_library(CAM_SYSTEM_YOCTO_OPENCV_CORE_LIBRARY
-        NAMES opencv_core)
-    find_library(CAM_SYSTEM_YOCTO_TEGRA_HAL_LIBRARY
-        NAMES tegra_hal
-        PATH_SUFFIXES opencv4/3rdparty)
-    find_library(CAM_SYSTEM_YOCTO_ZLIB_LIBRARY
-        NAMES z)
-
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_OPENCV_INCLUDE_DIR}" "Yocto OpenCV include directory")
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_OPENCV_VIDEO_LIBRARY}" "Yocto OpenCV video library")
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_OPENCV_IMGPROC_LIBRARY}" "Yocto OpenCV imgproc library")
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_OPENCV_CORE_LIBRARY}" "Yocto OpenCV core library")
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_TEGRA_HAL_LIBRARY}" "Yocto OpenCV tegra_hal library")
-    cam_system_require_path("${CAM_SYSTEM_YOCTO_ZLIB_LIBRARY}" "Yocto zlib library")
-
-    set(OpenCV_INCLUDE_DIRS "${CAM_SYSTEM_YOCTO_OPENCV_INCLUDE_DIR}")
-    set(OpenCV_LIBS
-        "${CAM_SYSTEM_YOCTO_OPENCV_VIDEO_LIBRARY}"
-        "${CAM_SYSTEM_YOCTO_OPENCV_IMGPROC_LIBRARY}"
-        "${CAM_SYSTEM_YOCTO_OPENCV_CORE_LIBRARY}"
-        "${CAM_SYSTEM_YOCTO_TEGRA_HAL_LIBRARY}"
-        "${CAM_SYSTEM_YOCTO_ZLIB_LIBRARY}"
-    )
-
     find_package(ncnn CONFIG QUIET)
     if(TARGET ncnn)
         set(CAM_SYSTEM_NCNN_TARGET ncnn)
@@ -151,19 +110,25 @@ endif()
 set(CAM_SYSTEM_C_SOURCES
     src/platform/hal_ov5640.c
     src/platform/hal_frmbuf.c
+    src/capture/frame_mailbox.c
+    src/capture/frame_view_timeline.c
     src/capture/capture.c
+    src/vision/face_accel_client.c
+    third_party/face_accel_ref/ultraface_decode.c
     src/media/jpeg_enc.c
+    src/media/jpeg_worker.c
     src/network/net_server.c
     src/network/ws_protocol.c
     src/network/cmd_handler.c
+    src/control/tracker_servo.c
     src/control/tracker.c
     third_party/cjson/cJSON.c
 )
 
 set(CAM_SYSTEM_CXX_SOURCES
     src/app/main.cpp
-    src/vision/yolo_detect.cpp
-    src/vision/optical_flow.cpp
+    src/vision/detector.cpp
+    src/vision/face_temporal_tracker.cpp
 )
 
 add_executable(cam_system
@@ -176,7 +141,7 @@ target_include_directories(cam_system
         "${CMAKE_SOURCE_DIR}/include"
         "${CMAKE_SOURCE_DIR}/src"
         "${CMAKE_SOURCE_DIR}/third_party"
-        ${OpenCV_INCLUDE_DIRS}
+        "${CMAKE_SOURCE_DIR}/third_party/face_accel_ref"
 )
 
 if(CAM_SYSTEM_ENABLE_WARNINGS)
@@ -189,11 +154,14 @@ if(CAM_SYSTEM_ENABLE_WARNINGS)
     )
 endif()
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM|aarch|AARCH")
+    target_compile_definitions(cam_system PRIVATE _ENABLE_NEON)
+endif()
+
 target_link_libraries(cam_system
     PRIVATE
         ${CAM_SYSTEM_NCNN_TARGET}
         ${CAM_SYSTEM_TURBOJPEG_TARGET}
-        ${OpenCV_LIBS}
         ssl
         crypto
         Threads::Threads
@@ -202,8 +170,7 @@ target_link_libraries(cam_system
 )
 
 install(TARGETS cam_system RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES
-    assets/models/yolov6lite_s/yolov6lite_s.ncnn.param
-    assets/models/yolov6lite_s/yolov6lite_s.ncnn.bin
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/cam-system/models/yolov6lite_s
+install(DIRECTORY assets/models/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/cam-system/models
+    PATTERN "face_accel" EXCLUDE
 )

@@ -12,6 +12,7 @@ typedef struct {
     float confidence;
     int   track_id;
     int   is_target;
+    int   publish;       /* 1: publish to frontend, 0: tracker-only candidate */
 } detection_t;
 
 typedef struct {
@@ -29,15 +30,29 @@ typedef enum {
     TRACK_CMD_SELECT
 } track_cmd_t;
 
-/* 每帧的 ISP offset 快照 */
+/*
+ * Per-captured-frame mapping from normalized display coordinates to the
+ * absolute 2x-subsampled sensor plane.  The transform belongs to the frame;
+ * consumers must not combine a delayed detection with the current viewport.
+ */
 typedef struct {
-    int xoff;
-    int yoff;
-} frame_offset_t;
+    unsigned int frame_seq;
+    double capture_time_sec;
+    float roi_x;
+    float roi_y;
+    float roi_w;
+    float roi_h;
+    int output_w;
+    int output_h;
+    int flip_x;
+    int flip_y;
+    int scaler_enabled;
+} frame_view_t;
 
 typedef struct {
     int cam_enabled;
-    int yolo_enabled;
+    /* Serialized as yolo_enabled for frontend protocol compatibility. */
+    int detector_enabled;
     int quit;
 
     int tracking_active;
@@ -47,9 +62,16 @@ typedef struct {
     unsigned int frame_seq;
     unsigned int status_seq;
 
-    /* 每个帧缓冲对应的 offset 快照 */
+    /* 每个帧缓冲对应的采集时刻和坐标变换 */
     pthread_mutex_t frame_mutex;
-    frame_offset_t frame_offsets[FRAME_BUF_CNT];
+    pthread_cond_t frame_cond;
+    frame_view_t frame_views[FRAME_BUF_CNT];
+    unsigned int frame_refcount[FRAME_BUF_CNT];
+    int frame_writing[FRAME_BUF_CNT];
+    double frame_publish_time_sec[FRAME_BUF_CNT];
+    int frame_publish_cursor;
+    unsigned int frame_wake_seq;
+    unsigned long frame_publish_drops;
 
     /* 预测框互斥锁 */
     pthread_mutex_t pred_mutex;
@@ -63,12 +85,12 @@ typedef struct {
     unsigned int jpeg_seq;
 
     pthread_mutex_t det_mutex;
-    detection_t detections[YOLO_MAX_DET];
+    detection_t detections[DETECTOR_MAX_DETECTIONS];
     int det_count;
     unsigned int det_seq;
     unsigned int det_frame_seq;
-    int det_frame_xoff;
-    int det_frame_yoff;
+    frame_view_t det_frame_view;
+    double det_publish_time_sec;
 
     pthread_mutex_t cmd_mutex;
     track_cmd_t track_cmd;

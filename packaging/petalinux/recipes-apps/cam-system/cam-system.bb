@@ -1,4 +1,4 @@
-SUMMARY = "Camera system with YOLO detection"
+SUMMARY = "Camera streaming, PL face detection, and digital-gimbal tracking"
 SECTION = "PETALINUX/apps"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
@@ -12,7 +12,7 @@ S = "${WORKDIR}/cam_system-src"
 
 inherit cmake pkgconfig
 
-DEPENDS = "ncnn cam-opencv libjpeg-turbo openssl zlib"
+DEPENDS = "ncnn libjpeg-turbo openssl"
 
 EXTRA_OECMAKE += " \
     -DCAM_SYSTEM_DEPENDENCY_MODE=YOCTO \
@@ -20,13 +20,13 @@ EXTRA_OECMAKE += " \
     -DCMAKE_SKIP_RPATH=ON \
     "
 
-RDEPENDS:${PN} += "libturbojpeg libssl libcrypto zlib libstdc++ libgcc"
+RDEPENDS:${PN} += "libturbojpeg libssl libcrypto libstdc++ libgcc cam-face-accel"
 
 do_compile:append() {
     ${WORKDIR}/verify_elf.sh ${B}/cam_system
 }
 
-CAM_SYSTEM_MODEL_DIR = "${datadir}/cam-system/models/yolov6lite_s"
+CAM_SYSTEM_MODEL_DIR = "${datadir}/cam-system/models"
 CAM_SYSTEM_MANIFEST_DIR = "${datadir}/cam-system/manifest"
 
 do_install:append() {
@@ -36,7 +36,6 @@ do_install:append() {
 
 FILES:${PN} += " \
     ${bindir}/cam_system \
-    ${CAM_SYSTEM_MODEL_DIR}/yolov6lite_s.ncnn.param \
-    ${CAM_SYSTEM_MODEL_DIR}/yolov6lite_s.ncnn.bin \
+    ${CAM_SYSTEM_MODEL_DIR} \
     ${CAM_SYSTEM_MANIFEST_DIR}/cam-system-artifacts.sha256 \
     "

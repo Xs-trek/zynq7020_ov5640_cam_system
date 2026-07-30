@@ -6,7 +6,7 @@ PLNX_PROJECT="${PLNX_PROJECT:-${HOME}/workdir/plnx_prj/zynq_plnx}"
 RECIPE_DIR="${PLNX_PROJECT}/project-spec/meta-user/recipes-apps/cam-system"
 IMAGE_APPEND="${PLNX_PROJECT}/project-spec/meta-user/recipes-core/images/petalinux-image-minimal.bbappend"
 TEMPLATE_RECIPE="${ROOT_DIR}/packaging/petalinux/recipes-apps/cam-system/cam-system.bb"
-MODEL_DIR="${ROOT_DIR}/assets/models/yolov6lite_s"
+MODEL_DIR="${ROOT_DIR}/assets/models"
 SOURCE_ARCHIVE="${RECIPE_DIR}/files/cam_system-src.tar.gz"
 
 if [[ ! -d "${PLNX_PROJECT}/project-spec/meta-user" ]]; then
@@ -37,13 +37,16 @@ git -C "${ROOT_DIR}" archive --format=tar --prefix=cam_system-src/ HEAD -- \
     cmake \
     include \
     src \
-    third_party/cjson | gzip -n > "${SOURCE_ARCHIVE}"
+    third_party/cjson \
+    third_party/face_accel_ref | gzip -n > "${SOURCE_ARCHIVE}"
 
 {
     printf 'git_commit %s\n' "${git_commit}"
     printf 'source_archive_sha256 %s\n' "$(sha256sum "${SOURCE_ARCHIVE}" | awk '{print $1}')"
-    printf 'model_param_sha256 %s\n' "$(sha256sum "${MODEL_DIR}/yolov6lite_s.ncnn.param" | awk '{print $1}')"
-    printf 'model_bin_sha256 %s\n' "$(sha256sum "${MODEL_DIR}/yolov6lite_s.ncnn.bin" | awk '{print $1}')"
+    find "${MODEL_DIR}" -type f -print0 |
+        sort -z |
+        xargs -0 sha256sum |
+        sed "s#${ROOT_DIR}/##"
 } > "${RECIPE_DIR}/files/cam-system-artifacts.sha256"
 
 if [[ -f "${IMAGE_APPEND}" ]] && ! grep -Eq '(^|[[:space:]])cam-system([[:space:]]|")' "${IMAGE_APPEND}"; then

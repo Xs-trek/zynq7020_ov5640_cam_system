@@ -48,6 +48,7 @@ static const char *coco_names_tbl[80] = {
 };
 
 static const char *coco_names_lookup(int id) {
+    if (id == DETECTION_CLASS_FACE) return "face";
     if (id >= 0 && id < 80) return coco_names_tbl[id];
     return "unknown";
 }
@@ -479,7 +480,7 @@ static int append_status_fields(char *json, size_t sz, int pos)
         "\"uptime_sec\":0,"
         "\"status_seq\":%u",
         app_state_load_int(&g_state.cam_enabled) ? "true" : "false",
-        app_state_load_int(&g_state.yolo_enabled) ? "true" : "false",
+        app_state_load_int(&g_state.detector_enabled) ? "true" : "false",
         app_state_load_int(&g_state.tracking_active) ? "true" : "false",
         target_id,
         status_seq);
@@ -653,15 +654,23 @@ int net_server_run(void)
         FD_ZERO(&rd_set);
         FD_SET(listen_fd, &rd_set);
         int max_fd = listen_fd;
+        int have_mjpeg_client = 0;
 
         for (int i = 0; i < client_count; i++) {
             if (clients[i].type != CLIENT_MJPEG) {
                 FD_SET(clients[i].fd, &rd_set);
+            } else {
+                have_mjpeg_client = 1;
             }
             if (clients[i].fd > max_fd) max_fd = clients[i].fd;
         }
 
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 33000 }; /* ~30fps */
+        /* 33 ms 固定等待再叠加 send/copy 开销只能得到约 29.1 fps。
+         * 有 MJPEG 客户端时缩短轮询等待；jpeg_seq 去重保证不会重复发帧。 */
+        struct timeval tv = {
+            .tv_sec = 0,
+            .tv_usec = have_mjpeg_client ? 5000 : 33000
+        };
         int nready = select(max_fd + 1, &rd_set, NULL, NULL, &tv);
 
         /* 新连接 */
@@ -774,19 +783,41 @@ void net_ws_broadcast_detections(void)
 
     char json[4096];
     int pos = 0;
+    detection_t det_snapshot[DETECTOR_MAX_DETECTIONS];
+    char frame_sequence_json[48];
+    unsigned int det_frame_seq;
+    int count;
+
+    /* Snapshot under the detector lock, then format and send without holding
+     * it.  A slow WebSocket client must never delay detector publication. */
+    pthread_mutex_lock(&g_state.det_mutex);
+    count = g_state.det_count;
+    if (count < 0) count = 0;
+    if (count > DETECTOR_MAX_DETECTIONS)
+        count = DETECTOR_MAX_DETECTIONS;
+    det_frame_seq = g_state.det_frame_seq;
+    memcpy(det_snapshot, g_state.detections,
+           (size_t)count * sizeof(detection_t));
+    pthread_mutex_unlock(&g_state.det_mutex);
+    if (cam_ws_format_detection_frame_seq(frame_sequence_json,
+                                           sizeof(frame_sequence_json),
+                                           det_frame_seq) < 0)
+        return;
 
     pos = json_append(json, sizeof(json), pos, "{\"status\":{");
     pos = append_status_fields(json, sizeof(json), pos);
-    pos = json_append(json, sizeof(json), pos, "},\"detections\":[");
+    pos = json_append(json, sizeof(json), pos,
+                      "},%s,\"detections\":[", frame_sequence_json);
     if (pos < 0)
         return;
 
-    pthread_mutex_lock(&g_state.det_mutex);
-    int count = g_state.det_count;
-    for (int i = 0; i < count && i < YOLO_MAX_DET; i++) {
-        detection_t *d = &g_state.detections[i];
+    int published = 0;
+    for (int i = 0; i < count && i < DETECTOR_MAX_DETECTIONS; i++) {
+        detection_t *d = &det_snapshot[i];
+        if (!d->publish)
+            continue;
         const char *class_name = coco_names_lookup(d->class_id);
-        if (i > 0)
+        if (published > 0)
             pos = json_append(json, sizeof(json), pos, ",");
         pos = json_append(json, sizeof(json), pos,
             "{\"bbox\":[%.1f,%.1f,%.1f,%.1f],"
@@ -798,12 +829,10 @@ void net_ws_broadcast_detections(void)
             d->bbox[2] * 640.0f, d->bbox[3] * 480.0f,
             class_name, d->confidence, d->track_id,
             d->is_target ? "true" : "false");
-        if (pos < 0) {
-            pthread_mutex_unlock(&g_state.det_mutex);
+        published++;
+        if (pos < 0)
             return;
-        }
     }
-    pthread_mutex_unlock(&g_state.det_mutex);
 
     pos = json_append(json, sizeof(json), pos, "]");
     if (pos < 0)

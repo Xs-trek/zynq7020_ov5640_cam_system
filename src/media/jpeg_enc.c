@@ -45,7 +45,7 @@ int jpeg_init(void)
     return 0;
 }
 
-int jpeg_encode_frame(const uint8_t *rgb_data)
+int jpeg_encode_frame(const uint8_t *rgb_data, unsigned int frame_seq)
 {
     if (!tj_handle || !rgb_data || !tj_buf) return -1;
 
@@ -76,7 +76,7 @@ int jpeg_encode_frame(const uint8_t *rgb_data)
         // 在 init 里分配的大小是最大的 tj_buf_size，所以这里不会越界
         memcpy(g_state.jpeg_buf, tj_buf, jpeg_size);
         g_state.jpeg_size = jpeg_size;
-        g_state.jpeg_seq = app_state_load_u32(&g_state.frame_seq);
+        g_state.jpeg_seq = frame_seq;
     }
 
     pthread_mutex_unlock(&g_state.jpeg_mutex);

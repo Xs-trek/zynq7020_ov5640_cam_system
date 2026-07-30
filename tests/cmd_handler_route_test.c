@@ -1,4 +1,5 @@
 #include "cam_system/app_state.h"
+#include "cam_system/frame_mailbox.h"
 #include "cam_system/tracker.h"
 #include "network/cmd_handler.h"
 
@@ -20,8 +21,8 @@ void app_state_init(app_state_t *s)
     s->track_target_id = -1;
     s->enabled_class_count = 1;
     s->enabled_classes[0] = 0;
-    s->max_det = YOLO_MAX_DET;
-    pthread_mutex_init(&s->frame_mutex, NULL);
+    s->max_det = DETECTOR_MAX_DETECTIONS;
+    frame_mailbox_init(s);
     pthread_mutex_init(&s->pred_mutex, NULL);
     pthread_mutex_init(&s->jpeg_mutex, NULL);
     pthread_mutex_init(&s->det_mutex, NULL);
@@ -31,7 +32,7 @@ void app_state_init(app_state_t *s)
 
 static void app_state_destroy(app_state_t *s)
 {
-    pthread_mutex_destroy(&s->frame_mutex);
+    frame_mailbox_destroy(s);
     pthread_mutex_destroy(&s->pred_mutex);
     pthread_mutex_destroy(&s->jpeg_mutex);
     pthread_mutex_destroy(&s->det_mutex);

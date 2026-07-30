@@ -406,13 +406,18 @@ static void cap_queue_v4l2_index_best_effort(int buf_idx)
     }
 }
 
-int frmbuf_capture_frame(int preferred_idx, int timeout_ms)
+int frmbuf_capture_frame(int preferred_idx, int timeout_ms,
+                         frmbuf_frame_info_t *info)
 {
     struct pollfd pfd;
     int latest_idx = -1;
+    frmbuf_frame_info_t latest_info;
     int ret;
 
     (void)preferred_idx;
+    memset(&latest_info, 0, sizeof(latest_info));
+    if (info)
+        memset(info, 0, sizeof(*info));
 
     if (video_fd < 0) {
         fprintf(stderr, "[capture-backend] not initialized\n");
@@ -475,8 +480,17 @@ int frmbuf_capture_frame(int preferred_idx, int timeout_ms)
             return -1;
         }
         latest_idx = (int)buf.index;
+        latest_info.sequence = buf.sequence;
+        latest_info.timestamp_sec = (double)buf.timestamp.tv_sec +
+                                    (double)buf.timestamp.tv_usec / 1000000.0;
+        latest_info.flags = buf.flags;
+        latest_info.timestamp_monotonic =
+            (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+            V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
     }
 
+    if (info)
+        *info = latest_info;
     return latest_idx;
 }
 

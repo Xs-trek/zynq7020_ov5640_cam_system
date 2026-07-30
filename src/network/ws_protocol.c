@@ -1,5 +1,6 @@
 #include "network/ws_protocol.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static int cam_ws_opcode_supported(uint8_t opcode)
@@ -104,4 +105,18 @@ int cam_ws_build_server_header(uint8_t opcode,
         *header_len = 4U;
     }
     return 0;
+}
+
+int cam_ws_format_detection_frame_seq(char *out,
+                                      size_t out_size,
+                                      uint32_t frame_seq)
+{
+    int length;
+
+    if (!out || out_size == 0U)
+        return -1;
+    length = snprintf(out, out_size, "\"frame_seq\":%u", frame_seq);
+    if (length < 0 || (size_t)length >= out_size)
+        return -1;
+    return length;
 }

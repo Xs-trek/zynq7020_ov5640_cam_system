@@ -2,6 +2,7 @@
 #include "network/cmd_handler.h"
 #include "platform/hal_ov5640.h"
 #include "cam_system/app_state.h"
+#include "cam_system/frame_mailbox.h"
 #include "cam_system/tracker.h"
 #include "cam_system/config.h"
 #include "cjson/cJSON.h"
@@ -14,7 +15,7 @@ extern tracker_t g_tracker;
 typedef enum {
     API_ROUTE_UNKNOWN = 0,
     API_ROUTE_CAMERA,
-    API_ROUTE_YOLO,
+    API_ROUTE_DETECTOR,
     API_ROUTE_TRACK,
     API_ROUTE_ZOOM,
     API_ROUTE_SETTINGS,
@@ -84,7 +85,7 @@ static api_route_t api_route_from_request(const char *request)
     if (strcmp(path, "/api/camera") == 0)
         return API_ROUTE_CAMERA;
     if (strcmp(path, "/api/yolo") == 0)
-        return API_ROUTE_YOLO;
+        return API_ROUTE_DETECTOR;
     if (strcmp(path, "/api/track") == 0)
         return API_ROUTE_TRACK;
     if (strcmp(path, "/api/zoom") == 0)
@@ -125,8 +126,8 @@ static void clear_detection_results(void)
     pthread_mutex_lock(&g_state.det_mutex);
     g_state.det_count = 0;
     g_state.det_frame_seq = 0;
-    g_state.det_frame_xoff = 0;
-    g_state.det_frame_yoff = 0;
+    g_state.det_publish_time_sec = 0.0;
+    memset(&g_state.det_frame_view, 0, sizeof(g_state.det_frame_view));
     app_state_inc_u32(&g_state.det_seq);
     pthread_mutex_unlock(&g_state.det_mutex);
 }
@@ -186,10 +187,11 @@ void cmd_handle_api(const char *request, const char *body,
             int enable = cJSON_IsTrue(en);
             app_state_store_int(&g_state.cam_enabled, enable);
             if (!enable) {
-                app_state_store_int(&g_state.yolo_enabled, 0);
+                app_state_store_int(&g_state.detector_enabled, 0);
                 clear_detection_and_tracking_outputs();
                 queue_track_stop_best_effort();
             }
+            frame_mailbox_wake_all(&g_state);
             notify_status_changed();
             printf("[cmd] Camera %s\n", enable ? "ON" : "OFF");
             make_response(response, resp_size, 200, "OK",
@@ -199,17 +201,18 @@ void cmd_handle_api(const char *request, const char *body,
                          "{\"error\":\"missing enabled\"}");
         }
 
-    } else if (route == API_ROUTE_YOLO) {
+    } else if (route == API_ROUTE_DETECTOR) {
         cJSON *en = json ? cJSON_GetObjectItem(json, "enabled") : NULL;
         if (en && cJSON_IsBool(en)) {
             int enable = cJSON_IsTrue(en);
-            app_state_store_int(&g_state.yolo_enabled, enable);
+            app_state_store_int(&g_state.detector_enabled, enable);
             if (!enable) {
                 clear_detection_and_tracking_outputs();
                 queue_track_stop_best_effort();
             }
+            frame_mailbox_wake_all(&g_state);
             notify_status_changed();
-            printf("[cmd] YOLO %s\n",
+            printf("[cmd] Detector %s\n",
                    enable ? "ON" : "OFF");
             make_response(response, resp_size, 200, "OK",
                          "{\"status\":\"ok\"}");
@@ -302,7 +305,8 @@ void cmd_handle_api(const char *request, const char *body,
 
         cJSON *md = cJSON_GetObjectItem(json, "max_det");
         if (md && cJSON_IsNumber(md)) {
-            new_max_det = clamp_int(md->valueint, 0, YOLO_MAX_DET);
+            new_max_det = clamp_int(md->valueint, 0,
+                                    DETECTOR_MAX_DETECTIONS);
         } else if (md) {
             settings_error = 1;
         }

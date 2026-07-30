@@ -34,4 +34,9 @@ int cam_ws_build_server_header(uint8_t opcode,
                                uint8_t header[10],
                                size_t *header_len);
 
+/* Source-frame metadata shared by detection JSON and frontend tests. */
+int cam_ws_format_detection_frame_seq(char *out,
+                                      size_t out_size,
+                                      uint32_t frame_seq);
+
 #endif

@@ -10,14 +10,16 @@
 extern "C" {
 #include "cam_system/config.h"
 #include "cam_system/app_state.h"
+#include "cam_system/frame_mailbox.h"
 #include "platform/hal_ov5640.h"
 #include "platform/hal_frmbuf.h"
 #include "capture/capture.h"
 #include "media/jpeg_enc.h"
+#include "media/jpeg_worker.h"
 #include "network/net_server.h"
 #include "cam_system/tracker.h"
 }
-#include "vision/yolo_detect.h"
+#include "vision/detector.h"
 
 /* ── 全局状态 ── */
 app_state_t g_state;
@@ -31,7 +33,7 @@ tracker_t g_tracker;
 void app_state_init(app_state_t *s)
 {
     s->cam_enabled = 0;
-    s->yolo_enabled = 0;
+    s->detector_enabled = 0;
     s->quit = 0;
     s->tracking_active = 0;
     s->tracking_target_id = -1;
@@ -40,11 +42,17 @@ void app_state_init(app_state_t *s)
     s->status_seq = 0;
 
     for (int i = 0; i < FRAME_BUF_CNT; i++) {
-        s->frame_offsets[i].xoff = 16;
-        s->frame_offsets[i].yoff = 4;
+        s->frame_views[i] = frame_view_t{};
+        s->frame_views[i].roi_w = SUBSAMPLED_1X_W;
+        s->frame_views[i].roi_h = SUBSAMPLED_1X_H;
+        s->frame_views[i].output_w = IMG_W;
+        s->frame_views[i].output_h = IMG_H;
+        s->frame_views[i].flip_x = 1;
+        s->frame_views[i].flip_y = 1;
+        s->frame_views[i].scaler_enabled = 1;
     }
     s->pred_box = predict_box_t{};
-    for (int i = 0; i < YOLO_MAX_DET; i++)
+    for (int i = 0; i < DETECTOR_MAX_DETECTIONS; i++)
         s->detections[i] = detection_t{};
 
     pthread_mutex_init(&s->jpeg_mutex, NULL);
@@ -52,7 +60,7 @@ void app_state_init(app_state_t *s)
     pthread_mutex_init(&s->cmd_mutex, NULL);
     pthread_mutex_init(&s->settings_mutex, NULL);
     pthread_mutex_init(&s->pred_mutex, NULL);
-    pthread_mutex_init(&s->frame_mutex, NULL);
+    frame_mailbox_init(s);
 
     s->jpeg_buf = NULL;
     s->jpeg_size = 0;
@@ -60,8 +68,8 @@ void app_state_init(app_state_t *s)
     s->det_count = 0;
     s->det_seq = 0;
     s->det_frame_seq = 0;
-    s->det_frame_xoff = ISP_DEFAULT_XOFF;
-    s->det_frame_yoff = ISP_DEFAULT_YOFF;
+    s->det_frame_view = s->frame_views[0];
+    s->det_publish_time_sec = 0.0;
     s->track_cmd = TRACK_CMD_NONE;
     s->track_target_id = -1;
     s->cmd_head = 0;
@@ -207,6 +215,16 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[main] JPEG init failed\n");
         return 1;
     }
+    if (jpeg_worker_init() < 0) {
+        fprintf(stderr, "[main] JPEG worker init failed\n");
+        return 1;
+    }
+
+    pthread_t jpeg_tid;
+    if (create_thread_on_core(&jpeg_tid, "JPEG worker",
+                              CAM_CPU_JPEG_CORE,
+                              jpeg_worker_thread, NULL) < 0)
+        return 1;
 
     /* 初始化 tracker */
     tracker_init(&g_tracker);
@@ -218,29 +236,34 @@ int main(int argc, char *argv[])
                               capture_thread, NULL) < 0)
         return 1;
 
-    /* 初始化并启动 YOLO 线程 */
-    if (yolo_init() < 0) {
-        fprintf(stderr, "[main] YOLO init failed, continuing without detection\n");
+    /* 初始化并启动检测线程 */
+    if (detector_init() < 0) {
+        fprintf(stderr, "[main] Detector init failed, continuing without detection\n");
     }
-    pthread_t yolo_tid;
-    if (create_thread_on_core(&yolo_tid, "YOLO thread", CAM_CPU_YOLO_CORE,
-                              yolo_thread, NULL) < 0)
+    pthread_t detector_tid;
+    if (create_thread_on_core(&detector_tid, "detector thread",
+                              CAM_CPU_DETECTOR_CORE,
+                              detector_thread, NULL) < 0)
         return 1;
 
     printf("[main] Starting HTTP server on port %d...\n\n", HTTP_PORT);
     net_server_run();  /* 阻塞直到 quit */
     app_state_store_int(&g_state.quit, 1);
+    frame_mailbox_wake_all(&g_state);
 
     /* ── 清理 ── */
     printf("[main] Shutting down...\n");
 
+    jpeg_worker_request_stop();
     pthread_join(cap_tid, NULL);
-    pthread_join(yolo_tid, NULL);
+    pthread_join(detector_tid, NULL);
+    pthread_join(jpeg_tid, NULL);
 
     ov5640_standby(1);
 
     jpeg_close();
-    yolo_close();
+    jpeg_worker_close();
+    detector_close();
     frmbuf_close();
     ov5640_close();
 
@@ -254,7 +277,7 @@ int main(int argc, char *argv[])
     pthread_mutex_destroy(&g_state.cmd_mutex);
     pthread_mutex_destroy(&g_state.settings_mutex);
     pthread_mutex_destroy(&g_state.pred_mutex);
-    pthread_mutex_destroy(&g_state.frame_mutex);
+    frame_mailbox_destroy(&g_state);
     if (g_state.jpeg_buf) free(g_state.jpeg_buf);
 
     printf("[main] Clean exit\n");

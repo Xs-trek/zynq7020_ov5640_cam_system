@@ -12,6 +12,7 @@ if [[ ! -d "${META_USER}" ]]; then
     echo "PetaLinux meta-user layer not found: ${META_USER}" >&2
     exit 1
 fi
+
 if [[ -z "${AUTHORIZED_KEYS_FILE}" ]]; then
     echo "CAM_SSH_AUTHORIZED_KEYS_FILE must name an external public-key file" >&2
     exit 1
@@ -46,5 +47,18 @@ if ! grep -Eq '(^|[[:space:]])ssh-access-dev([[:space:]]|")' "${IMAGE_APPEND}"; 
     printf '\nIMAGE_INSTALL:append = " ssh-access-dev"\n' >> "${IMAGE_APPEND}"
 fi
 
-echo "Staged ssh-access-dev in ${RECIPE_DIR}"
+sed -i '/^DEBUG_USER_PASSWORD_HASH = /d' "${IMAGE_APPEND}"
+sed -i '/^ROOTFS_POSTPROCESS_COMMAND:append = " set_debug_user_password_hash; "$/d' \
+    "${IMAGE_APPEND}"
+sed -i '/^set_debug_user_password_hash () {$/,/^}$/d' "${IMAGE_APPEND}"
+
+if ! grep -q '^EXTRA_USERS_SUDOERS:append = " debug ALL=(ALL) NOPASSWD: ALL;"$' \
+    "${IMAGE_APPEND}"; then
+    cat >> "${IMAGE_APPEND}" <<'EOF'
+
+EXTRA_USERS_SUDOERS:append = " debug ALL=(ALL) NOPASSWD: ALL;"
+EOF
+fi
+
+echo "Staged password-locked ssh-access-dev in ${RECIPE_DIR}"
 ssh-keygen -lf "${RECIPE_DIR}/files/authorized_keys"

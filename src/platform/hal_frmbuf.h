@@ -3,14 +3,22 @@
 
 #include <stdint.h>
 
+typedef struct {
+    uint32_t sequence;
+    double timestamp_sec;
+    uint32_t flags;
+    int timestamp_monotonic;
+} frmbuf_frame_info_t;
+
 /* 初始化 V4L2 采集后端，返回 0 成功。 */
 int frmbuf_init(void);
 
 /* 返回后端持有的帧缓冲虚拟地址。 */
 uint8_t *frmbuf_get_buffer(int buf_idx);
 
-/* 采集一帧，返回实际完成的 mmap buffer index。 */
-int frmbuf_capture_frame(int preferred_idx, int timeout_ms);
+/* 采集一帧，返回实际完成的 mmap buffer index。info 可为 NULL。 */
+int frmbuf_capture_frame(int preferred_idx, int timeout_ms,
+                         frmbuf_frame_info_t *info);
 
 /* 释放已完成帧；V4L2 后端会重新 QBUF。 */
 int frmbuf_release_frame(int buf_idx);

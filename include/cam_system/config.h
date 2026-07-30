@@ -9,11 +9,18 @@
 #define FRAME_SIZE      (IMG_W * IMG_H * IMG_BPP)   /* 921600 */
 #define FRAME_BUF_CNT   3
 
+/* Crop/scaler commands are issued after V4L2 frame N is dequeued.  Board
+ * calibration for this hardware generation maps that command to frame N+2.
+ * The release acceptance trace must verify this single value; consumers must
+ * never average multiple possible viewport transforms. */
+#define ISP_APPLY_DELAY_FRAMES 2
+
 /* ── PS CPU 亲和性 ── */
 #define CAM_CPU_CONTROL_CORE   0   /* capture/control + HTTP/WebSocket */
 #define CAM_CPU_CAPTURE_CORE   CAM_CPU_CONTROL_CORE
 #define CAM_CPU_NETWORK_CORE   CAM_CPU_CONTROL_CORE
-#define CAM_CPU_YOLO_CORE      1   /* NCNN 单线程推理 */
+#define CAM_CPU_DETECTOR_CORE  1   /* 检测线程；PL 加速路径等待 IRQ，YOLO 回退使用 NCNN */
+#define CAM_CPU_JPEG_CORE      1   /* JPEG 与等待 PL 完成的检测线程共享 Core 1 */
 
 /* ── OV5640 Sensor 物理参数 ── */
 #define SENSOR_FULL_W         2624      /* 物理窗口最大宽 (X: 0~2623) */
@@ -52,13 +59,14 @@
 #define MJPEG_SEND_WAIT_BUDGET_MS       12
 #define HTTP_SEND_WAIT_BUDGET_MS        50
 
-/* ── YOLO ── */
+/* ── 检测器上限与 YOLOv6Lite-S 兼容回退 ── */
 #define YOLO_INPUT_W          256
 #define YOLO_INPUT_H          192
 #define YOLO_CONF_THRESH      0.5f
 #define YOLO_NMS_THRESH       0.5f
-#define YOLO_MAX_DET          20
+#define DETECTOR_MAX_DETECTIONS 20
 #define YOLO_NUM_CLASSES      80
+#define DETECTION_CLASS_FACE  80
 
 /* ── JPEG ── */
 #define JPEG_QUALITY          70
@@ -67,26 +75,90 @@
 #define MODEL_PARAM_PATH      "/usr/share/cam-system/models/yolov6lite_s/yolov6lite_s.ncnn.param"
 #define MODEL_BIN_PATH        "/usr/share/cam-system/models/yolov6lite_s/yolov6lite_s.ncnn.bin"
 
-/* ── 跟踪参数 ── */
+/* ── 跟踪参数：时间戳 Kalman + 独立 viewport 控制器 ── */
+#define TRACK_HISTORY_SIZE          8
+#define TRACK_KF_ACCEL_VAR_XY       100000.0f
+#define TRACK_KF_ACCEL_VAR_SCALE    1.5f
+#define TRACK_ASSOC_NIS_GATE        9.21f
+#define TRACK_ASSOC_EXACT_NIS_GATE  25.0f
+#define TRACK_REBUILD_IOU_GATE      0.10f
+#define TRACK_REBIND_CONFIRM_FRAMES 2
+#define TRACK_ASSOC_PRIVATE_VAR_SCALE 4.0f
+#define TRACK_UNASSOCIATED_VAR_SCALE 9.0f
+#define TRACK_MEAS_SIGMA_BASE_PX    3.0f
+#define TRACK_MEAS_Y_VAR_SCALE      1.6f
+#define TRACK_FACE_ANCHOR_Y_RATIO   0.42f
+#define TRACK_VIEW_ANCHOR_X_RATIO   0.50f
+#define TRACK_VIEW_ANCHOR_Y_RATIO   0.42f
+#define TRACK_EXACT_GATE_BASE_PX    32.0f
+#define TRACK_EXACT_GATE_SPEED_PX_S 900.0f
+#define TRACK_EXACT_GATE_MAX_PX     150.0f
 
-/* α-β 估计层 */
-#define AB_ALPHA            0.9f      /* 位置修正增益 */
-#define AB_BETA_RATE        1.71f     /* 速度修正增益 (1/s, 频率无关) */
+#define TRACK_MISS_GRACE_SEC        0.12f
+#define TRACK_COAST_SEC             0.50f
+#define TRACK_HOLD_SEC              0.75f
+#define TRACK_LOST_SEC              1.50f
+#define TRACK_RECOVER_CONFIRM_FRAMES 2
 
-#define OF_AB_ALPHA         0.45f
-#define OF_AB_BETA_RATE     0.85f
+/* Target-state retention and viewport motion are deliberately separate.
+ * The association estimator may coast for TRACK_COAST_SEC, but the camera
+ * follows an unobserved constant-velocity target for only this bounded time
+ * before entering the same jerk-limited brake used by HOLD/LOST/RECOVER. */
+#define TRACK_COMMAND_COAST_SEC     0.15f
 
-/* 二阶临界阻尼执行层 */
-#define DAMP_OMEGA          8.0f      /* 自然频率 (rad/s) */
+/* Frontend identity tracking uses a bounded centre-velocity prediction.
+ * Retention is not tied to camera HOLD state, and bbox edges are never
+ * extrapolated independently because near-face scale changes make that model
+ * geometrically unstable. */
+#define TRACK_TEMPORAL_RETAIN_SEC       0.75f
+#define TRACK_TEMPORAL_PREDICT_MAX_SEC  0.35f
+#define TRACK_TEMPORAL_MAX_SPEED_PX_S   900.0f
+#define TRACK_TEMPORAL_VELOCITY_BLEND   0.35f
 
-/* 状态机 */
-#define SM_WINDOW_SIZE      10        /* 滑动窗口大小 */
-#define SM_CONF_TRACK       0.5f      /* 跟踪阈值 */
-#define SM_CONF_COAST       0.2f      /* 滑行阈值 */
-#define SM_LOST_TIMEOUT     3.0f      /* 丢失超时(秒) */
+/* Digital-gimbal screen composer.  The detector/Kalman layer supplies one
+ * target position at the N+2 command-effective time.  The composer acts only
+ * on that position: detector velocity is deliberately not a camera command.
+ *
+ * Small errors are ignored with Schmitt hysteresis.  The entry floors cover
+ * the measured bbox noise scale; live KF covariance may widen them up to the
+ * caps below.  A three-frame fading local-linear fit then supplies a mutually
+ * consistent reference position and velocity to the final path generator. */
+#define TRACK_CONTROL_FPS           30.0f
+#define TRACK_COMMAND_LEAD_SEC      \
+    ((float)ISP_APPLY_DELAY_FRAMES / TRACK_CONTROL_FPS)
+#define TRACK_VIEW_NOISE_SIGMA_MULT 1.5f
+#define TRACK_VIEW_NOISE_ENTER_X_MIN_PX 6.0f
+#define TRACK_VIEW_NOISE_ENTER_Y_MIN_PX 8.0f
+#define TRACK_VIEW_NOISE_ENTER_X_MAX_PX 12.0f
+#define TRACK_VIEW_NOISE_ENTER_Y_MAX_PX 16.0f
+#define TRACK_VIEW_NOISE_EXIT_RATIO 0.50f
+#define TRACK_REFERENCE_WINDOW_FRAMES 3.0f
+#define TRACK_REFERENCE_ALPHA       \
+    (2.0f * (2.0f * TRACK_REFERENCE_WINDOW_FRAMES - 1.0f) / \
+     (TRACK_REFERENCE_WINDOW_FRAMES * \
+      (TRACK_REFERENCE_WINDOW_FRAMES + 1.0f)))
+#define TRACK_REFERENCE_BETA        \
+    (6.0f / (TRACK_REFERENCE_WINDOW_FRAMES * \
+             (TRACK_REFERENCE_WINDOW_FRAMES + 1.0f)))
+#define TRACK_VIEW_PATH_OMEGA_X     6.0f
+#define TRACK_VIEW_MAX_VEL_X        450.0f
+#define TRACK_VIEW_MAX_ACCEL_X      1800.0f
+#define TRACK_VIEW_MAX_JERK_X       7200.0f
+#define TRACK_VIEW_PATH_OMEGA_Y     6.0f
+#define TRACK_VIEW_MAX_VEL_Y        300.0f
+#define TRACK_VIEW_MAX_ACCEL_Y      1800.0f
+#define TRACK_VIEW_MAX_JERK_Y       7200.0f
+#define TRACK_VIEW_MAX_STEP_X_PX    \
+    (TRACK_VIEW_MAX_VEL_X / TRACK_CONTROL_FPS)
+#define TRACK_VIEW_MAX_STEP_Y_PX    \
+    (TRACK_VIEW_MAX_VEL_Y / TRACK_CONTROL_FPS)
 
-/* 目标匹配 */
-#define MATCH_DIST_PX       150.0f    /* subsample 像素距离阈值 */
+/* The same moving crop is also the detector input.  These are acceptance
+ * margins for the control anchor, not a demand that the whole bbox be visible.
+ * The vertical value protects the 42% control anchor, not the full near-face
+ * bbox, which may be physically impossible to contain. */
+#define TRACK_VIEW_CORE_MARGIN_X_PX 96.0f
+#define TRACK_VIEW_CORE_MARGIN_Y_PX 24.0f
 
 /* ISP offset 默认值 */
 #define ISP_DEFAULT_XOFF    16
