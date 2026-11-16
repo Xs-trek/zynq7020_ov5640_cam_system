@@ -28,6 +28,24 @@ typedef struct {
 } uf_face_t;
 
 /*
+ * Compact, image-free diagnostics for one raw accelerator result.  The hash
+ * covers all score and box tensor bytes (but not the frame-dependent output
+ * header), so identical inputs can be checked for bit-exact repeatability.
+ */
+typedef struct {
+    uint64_t tensor_hash;
+    float top_confidence;
+    uint16_t top_prior_index;
+    int8_t top_background_q;
+    int8_t top_face_q;
+    int8_t top_box_q[4];
+} uf_tensor_summary_t;
+
+int uf_summarize_tensors_s8(const int8_t *scores,
+                            const int8_t *boxes,
+                            uf_tensor_summary_t *summary);
+
+/*
  * Decode row-major signed-int8 tensors:
  *   scores[4420][2], boxes[4420][4].
  * Returned x/y/w/h are clipped and normalized to the 640x480 input frame.

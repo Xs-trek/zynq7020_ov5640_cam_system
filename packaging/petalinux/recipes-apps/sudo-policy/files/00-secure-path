@@ -1,0 +1,3 @@
+# Installed by the sudo-policy recipe.  A non-login SSH session has only /usr/bin:/bin in PATH,
+# and sudo keeps the caller's PATH unless secure_path is set.
+Defaults secure_path="/usr/sbin:/usr/bin:/sbin:/bin"

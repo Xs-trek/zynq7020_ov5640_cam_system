@@ -7,7 +7,10 @@
 #define IMG_H           480
 #define IMG_BPP         3
 #define FRAME_SIZE      (IMG_W * IMG_H * IMG_BPP)   /* 921600 */
-#define FRAME_BUF_CNT   3
+#define FRAME_BUF_CNT   3   /* cached copies, for consumers that read frames on the CPU */
+/* V4L2 buffers.  The mailbox can hold two for direct readers (the newest frame and one being
+ * read); the rest stay with the hardware. */
+#define CAPTURE_BUF_CNT 6
 
 /* Crop/scaler commands are issued after V4L2 frame N is dequeued.  Board
  * calibration for this hardware generation maps that command to frame N+2.
@@ -19,28 +22,11 @@
 #define CAM_CPU_CONTROL_CORE   0   /* capture/control + HTTP/WebSocket */
 #define CAM_CPU_CAPTURE_CORE   CAM_CPU_CONTROL_CORE
 #define CAM_CPU_NETWORK_CORE   CAM_CPU_CONTROL_CORE
-#define CAM_CPU_DETECTOR_CORE  1   /* 检测线程；PL 加速路径等待 IRQ，YOLO 回退使用 NCNN */
+#define CAM_CPU_DETECTOR_CORE  1   /* 检测线程，大部分时间在等 PL 完成 */
 #define CAM_CPU_JPEG_CORE      1   /* JPEG 与等待 PL 完成的检测线程共享 Core 1 */
 
-/* ── OV5640 Sensor 物理参数 ── */
-#define SENSOR_FULL_W         2624      /* 物理窗口最大宽 (X: 0~2623) */
-#define SENSOR_FULL_H         1944      /* 物理窗口最大高 (Y: 4~1947) */
-#define SENSOR_Y_START_MIN    4         /* Y 起始最小值 */
-#define SENSOR_X_START_MIN    0         /* X 起始最小值 */
-
 /* ── ISP 窗口 / 数字云台参数 ── */
-#define SUBSAMPLE_FACTOR      2         /* 当前 2x subsample 固定 */
-#define ZOOM_MIN              100       /* 1.0x */
-#define ZOOM_MAX              200       /* 2.0x (P3: subsample=2x 下极限) */
-#define ZOOM_DEFAULT          100       /* 默认 1.0x */
-
-/* zoom=1x 时的 sensor 窗口（与 init 寄存器表一致） */
-#define ISP_WIN_1X_W          2624      /* 0x0000 ~ 0x0A3F */
-#define ISP_WIN_1X_H          1944      /* 0x0004 ~ 0x079B */
-#define ISP_WIN_1X_CX         1312      /* 中心 X */
-#define ISP_WIN_1X_CY         976       /* 中心 Y = (4+1947)/2 ≈ 976 */
-
-/* subsampled 后中心（zoom=1x, offset=(16,4) → 居中值） */
+/* 2x subsample 后的窗口（offset=(16,4) 时居中） */
 #define SUBSAMPLED_1X_W       1312      /* 2624/2 */
 #define SUBSAMPLED_1X_H       972       /* 1944/2 */
 
@@ -58,22 +44,49 @@
 #define MJPEG_OUTQ_DROP_THRESHOLD_BYTES (96 * 1024)
 #define MJPEG_SEND_WAIT_BUDGET_MS       12
 #define HTTP_SEND_WAIT_BUDGET_MS        50
+#define WS_STATUS_PERIOD_SEC            1.0
+/* A client that connects and says nothing must not keep a slot. */
+#ifndef HTTP_REQUEST_TIMEOUT_SEC
+#define HTTP_REQUEST_TIMEOUT_SEC        10.0
+#endif
+/* A connection that goes silent is given up after about ten seconds; the page reconnects. */
+#define CLIENT_KEEPALIVE_IDLE_SEC       3
+#define CLIENT_KEEPALIVE_INTERVAL_SEC   2
+#define CLIENT_KEEPALIVE_PROBES         3
+#define CLIENT_TCP_USER_TIMEOUT_MS      10000u
 
-/* ── 检测器上限与 YOLOv6Lite-S 兼容回退 ── */
+/* ── 检测 ── */
+#define DETECTOR_CONF_THRESH  0.5f
+#define DETECTOR_MAX_DET      20
+#define DETECTOR_MAX_CLASSES  80    /* 只有 CPU 候选模型有类别；人脸模型只有一类 */
+/* 只用于 CPU 候选模型 YOLOv6 */
 #define YOLO_INPUT_W          256
 #define YOLO_INPUT_H          192
-#define YOLO_CONF_THRESH      0.5f
 #define YOLO_NMS_THRESH       0.5f
-#define DETECTOR_MAX_DETECTIONS 20
-#define YOLO_NUM_CLASSES      80
 #define DETECTION_CLASS_FACE  80
 
 /* ── JPEG ── */
-#define JPEG_QUALITY          70
+#define JPEG_QUALITY          70        /* default of jpeg.quality (app_config) */
 
 /* ── 模型路径（板上部署路径） ── */
 #define MODEL_PARAM_PATH      "/usr/share/cam-system/models/yolov6lite_s/yolov6lite_s.ncnn.param"
 #define MODEL_BIN_PATH        "/usr/share/cam-system/models/yolov6lite_s/yolov6lite_s.ncnn.bin"
+#define ULTRAFACE_RFB320_PARAM_PATH \
+    "/usr/share/cam-system/models/ultraface_rfb_320/RFB-320.param"
+#define ULTRAFACE_RFB320_BIN_PATH \
+    "/usr/share/cam-system/models/ultraface_rfb_320/RFB-320.bin"
+#define SCRFD_500M_640_PARAM_PATH \
+    "/usr/share/cam-system/models/scrfd_500m_640/scrfd_500m_shape640x640.param"
+#define SCRFD_500M_640_BIN_PATH \
+    "/usr/share/cam-system/models/scrfd_500m_640/scrfd_500m_shape640x640.bin"
+#define SCRFD_1G_640_PARAM_PATH \
+    "/usr/share/cam-system/models/scrfd_1g_640/scrfd_1g_shape640x640.param"
+#define SCRFD_1G_640_BIN_PATH \
+    "/usr/share/cam-system/models/scrfd_1g_640/scrfd_1g_shape640x640.bin"
+#define SCRFD_2_5G_KPS_640_PARAM_PATH \
+    "/usr/share/cam-system/models/scrfd_2_5g_kps_640/scrfd_2.5g_bnkps_shape640x640.param"
+#define SCRFD_2_5G_KPS_640_BIN_PATH \
+    "/usr/share/cam-system/models/scrfd_2_5g_kps_640/scrfd_2.5g_bnkps_shape640x640.bin"
 
 /* ── 跟踪参数：时间戳 Kalman + 独立 viewport 控制器 ── */
 #define TRACK_HISTORY_SIZE          8
@@ -140,14 +153,20 @@
 #define TRACK_REFERENCE_BETA        \
     (6.0f / (TRACK_REFERENCE_WINDOW_FRAMES * \
              (TRACK_REFERENCE_WINDOW_FRAMES + 1.0f)))
-#define TRACK_VIEW_PATH_OMEGA_X     6.0f
-#define TRACK_VIEW_MAX_VEL_X        450.0f
+/* Path bandwidth for v0.2.0 timing: the tick gets this frame's detection (0 frames) with the
+ * 24 ms deadline.  brake_axis uses the same omega and jerk (docs/V020_RELEASE_NOTES.md).
+ * Speed limits: the P99 of a face's image speed over the human motion envelope
+ * (docs/V020_RELEASE_NOTES.md).  Acceleration stays at 1800 px/s^2, 2 px/frame^2: the integer
+ * delta <= 3 line bounds it.
+ * The single-frame step line of the tests is the speed limit times the frame interval. */
+#define TRACK_VIEW_PATH_OMEGA_X     8.0f
+#define TRACK_VIEW_MAX_VEL_X        780.0f
 #define TRACK_VIEW_MAX_ACCEL_X      1800.0f
-#define TRACK_VIEW_MAX_JERK_X       7200.0f
-#define TRACK_VIEW_PATH_OMEGA_Y     6.0f
-#define TRACK_VIEW_MAX_VEL_Y        300.0f
+#define TRACK_VIEW_MAX_JERK_X       18000.0f
+#define TRACK_VIEW_PATH_OMEGA_Y     8.0f
+#define TRACK_VIEW_MAX_VEL_Y        540.0f
 #define TRACK_VIEW_MAX_ACCEL_Y      1800.0f
-#define TRACK_VIEW_MAX_JERK_Y       7200.0f
+#define TRACK_VIEW_MAX_JERK_Y       18000.0f
 #define TRACK_VIEW_MAX_STEP_X_PX    \
     (TRACK_VIEW_MAX_VEL_X / TRACK_CONTROL_FPS)
 #define TRACK_VIEW_MAX_STEP_Y_PX    \

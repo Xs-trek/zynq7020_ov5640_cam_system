@@ -1,0 +1,1092 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>数字云台</title>
+  <style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242837;
+    --border: #2e3348;
+    --text: #e4e6f0;
+    --text2: #8b8fa8;
+    --accent: #4f8cff;
+    --accent-dim: #2a4a8a;
+    --green: #2dd4a0;
+    --green-dim: #1a6b52;
+    --red: #ff4d6a;
+    --red-dim: #8a2a3a;
+    --orange: #ff9f43;
+    --yellow: #ffd93d;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    overflow: hidden; height: 100vh; height: 100dvh;
+    user-select: none; -webkit-user-select: none;
+  }
+  button { font-family: inherit; cursor: pointer; border: none; outline: none; }
+  input { font-family: inherit; outline: none; }
+
+  /* ===== Connection Page ===== */
+  #connectPage {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; padding: 24px; gap: 20px;
+  }
+  .connect-logo {
+    width: 80px; height: 80px; border-radius: 20px;
+    background: linear-gradient(135deg, var(--accent), #7c3aed);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 36px; margin-bottom: 8px;
+  }
+  .connect-title { font-size: 24px; font-weight: 700; }
+  .connect-sub { font-size: 13px; color: var(--text2); margin-top: -8px; }
+  .connect-input-group {
+    width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .connect-input-group label { font-size: 13px; color: var(--text2); }
+  .connect-input {
+    width: 100%; padding: 14px 16px; border-radius: 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font-size: 16px;
+  }
+  .connect-input:focus { border-color: var(--accent); }
+  .connect-btn {
+    width: 100%; max-width: 360px; padding: 14px;
+    border-radius: 12px; font-size: 16px; font-weight: 600;
+    background: linear-gradient(135deg, var(--accent), #7c3aed);
+    color: #fff; transition: opacity .2s;
+  }
+  .connect-btn:active { opacity: .7; }
+  .connect-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .connect-error {
+    font-size: 13px; color: var(--red); min-height: 20px; text-align: center;
+  }
+
+  /* ===== Main Page ===== */
+  #mainPage { display: none; flex-direction: column; height: 100%; }
+
+  /* Top Bar */
+  .topbar {
+    display: flex; align-items: center; padding: 8px 12px; gap: 8px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    flex-shrink: 0; min-height: 48px; z-index: 20;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 8px; flex: 1; }
+  .cam-indicator {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--red); flex-shrink: 0;
+    box-shadow: 0 0 6px var(--red);
+    transition: all .3s;
+  }
+  .cam-indicator.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .topbar-title { font-size: 15px; font-weight: 600; }
+  .topbar-btn {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: var(--surface2); color: var(--text2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; flex-shrink: 0; transition: all .2s;
+  }
+  .topbar-btn:active { background: var(--border); }
+  .topbar-btn.active { color: var(--accent); background: var(--accent-dim); }
+
+  /* Video Area */
+  .video-area {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden; background: #000;
+    min-height: 0;
+  }
+  .video-container {
+    position: relative; display: flex; align-items: center; justify-content: center;
+  }
+  #videoImg {
+    display: block; max-width: 100%; max-height: 100%;
+    object-fit: contain;
+  }
+  #overlayCanvas {
+    position: absolute; top: 0; left: 0;
+    pointer-events: none;
+  }
+  #videoTapArea {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 5;
+  }
+  .video-overlay-msg {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    background: rgba(0,0,0,.7); color: #fff; padding: 12px 24px;
+    border-radius: 12px; font-size: 14px; display: none;
+    z-index: 10; text-align: center;
+  }
+  .cam-off-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: var(--bg); z-index: 8; gap: 12px;
+  }
+  .cam-off-overlay .icon { font-size: 48px; opacity: .3; }
+  .cam-off-overlay .label { font-size: 14px; color: var(--text2); }
+
+  /* Control Bar */
+  .control-bar {
+    flex-shrink: 0; padding: 10px 12px; background: var(--surface);
+    border-top: 1px solid var(--border); z-index: 20;
+  }
+  .ctrl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .ctrl-row:last-child { margin-bottom: 0; }
+
+  .toggle-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 14px; border-radius: 10px; font-size: 13px; font-weight: 600;
+    background: var(--surface2); color: var(--text2);
+    border: 1px solid var(--border); transition: all .2s;
+  }
+  .toggle-btn .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text2); transition: all .2s;
+  }
+  .toggle-btn.on { background: var(--green-dim); color: var(--green); border-color: var(--green); }
+  .toggle-btn.on .dot { background: var(--green); }
+  .toggle-btn.on-red { background: var(--red-dim); color: var(--red); border-color: var(--red); }
+  .toggle-btn.on-red .dot { background: var(--red); }
+  .toggle-btn:disabled { opacity: .35; cursor: not-allowed; }
+  .toggle-btn:active:not(:disabled) { transform: scale(.96); }
+
+  .cam-toggle-btn {
+    padding: 8px 14px; border-radius: 10px; font-size: 13px; font-weight: 600;
+    transition: all .2s; display: flex; align-items: center; gap: 6px;
+    background: var(--green-dim); color: var(--green); border: 1px solid var(--green);
+  }
+  .cam-toggle-btn.off {
+    background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+  }
+  .cam-toggle-btn:active { transform: scale(.96); }
+
+  /* Status Bar */
+  .status-bar {
+    flex-shrink: 0; display: flex; align-items: center; gap: 4px;
+    padding: 6px 12px; background: var(--bg);
+    border-top: 1px solid var(--border); font-size: 11px; color: var(--text2);
+    z-index: 20; flex-wrap: wrap;
+  }
+  .status-item { display: flex; align-items: center; gap: 3px; }
+  .status-dot { width: 5px; height: 5px; border-radius: 50%; }
+  .status-sep { color: var(--border); margin: 0 2px; }
+
+  /* Info Panel */
+  .info-panel {
+    display: none; position: absolute; top: 48px; right: 0; left: 0; bottom: 0;
+    z-index: 50; background: rgba(0,0,0,.6); backdrop-filter: blur(8px);
+    padding: 20px; overflow-y: auto;
+  }
+  .info-panel.show { display: block; }
+  .info-card {
+    max-width: 400px; margin: 0 auto;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 20px; 
+  }
+  .info-card h3 { font-size: 16px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .info-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .info-row:last-child { border-bottom: none; }
+  .info-row .label { color: var(--text2); }
+  .info-row .value { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .info-close-btn {
+    margin-top: 16px; width: 100%; padding: 10px; border-radius: 10px;
+    background: var(--surface2); color: var(--text); font-size: 14px; font-weight: 600;
+  }
+
+  /* Settings Panel */
+  .settings-panel {
+    display: none; position: absolute; top: 48px; right: 0; left: 0; bottom: 0;
+    z-index: 50; background: rgba(0,0,0,.6); backdrop-filter: blur(8px);
+    padding: 16px; overflow-y: auto;
+  }
+  .settings-panel.show { display: block; }
+  .settings-card {
+    max-width: 420px; margin: 0 auto;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 16px; padding: 20px;
+  }
+  .settings-card h3 { font-size: 16px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .settings-section { margin-bottom: 16px; }
+  .settings-section-title { font-size: 13px; color: var(--text2); margin-bottom: 8px; }
+  .maxdet-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .maxdet-row label { font-size: 13px; color: var(--text2); white-space: nowrap; }
+  .maxdet-row input {
+    width: 60px; padding: 6px 8px; border-radius: 8px; text-align: center;
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-size: 14px;
+  }
+  /* Console Panel */
+  .console-panel {
+    display: none; position: absolute; top: 48px; right: 0; left: 0; bottom: 0;
+    z-index: 50; background: var(--bg);
+    flex-direction: column;
+  }
+  .console-panel.show { display: flex; }
+  .console-log {
+    flex: 1; overflow-y: auto; padding: 8px 12px; font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 11px; line-height: 1.6;
+  }
+  .console-log .log-entry { padding: 2px 0; word-break: break-all; }
+  .log-entry.sent { color: var(--accent); }
+  .log-entry.sent::before { content: "▶ "; }
+  .log-entry.recv { color: var(--green); }
+  .log-entry.recv::before { content: "◀ "; }
+  .log-entry.info { color: var(--text2); }
+  .log-entry.info::before { content: "ℹ "; }
+  .log-entry.error { color: var(--red); }
+  .log-entry.error::before { content: "✕ "; }
+  .console-input-row {
+    display: flex; gap: 8px; padding: 8px 12px;
+    border-top: 1px solid var(--border); flex-shrink: 0;
+  }
+  .console-input {
+    flex: 1; padding: 10px 12px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font-size: 13px; font-family: "SF Mono", "Fira Code", monospace;
+  }
+  .console-send-btn {
+    padding: 10px 18px; border-radius: 10px; font-size: 13px; font-weight: 600;
+    background: var(--accent); color: #fff;
+  }
+  .console-send-btn:active { opacity: .7; }
+  .console-clear-btn {
+    padding: 10px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+  }
+
+  /* Landscape tweaks */
+  @media (orientation: landscape) {
+    .control-bar { padding: 6px 12px; }
+    .ctrl-row { margin-bottom: 4px; }
+    .status-bar { padding: 4px 12px; }
+    .topbar { min-height: 40px; padding: 4px 12px; }
+  }
+
+  /* Safe area for notch phones */
+  @supports (padding-top: env(safe-area-inset-top)) {
+    .topbar { padding-top: max(8px, env(safe-area-inset-top)); }
+    .status-bar { padding-bottom: max(6px, env(safe-area-inset-bottom)); }
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- ===== Connection Page ===== -->
+<div id="connectPage">
+  <div class="connect-logo">📷</div>
+  <div class="connect-title">数字云台</div>
+  <div class="connect-sub">Digital Camera Platform Controller</div>
+  <div class="connect-input-group">
+    <label>设备 IP 地址</label>
+    <input class="connect-input" id="ipInput" type="text" placeholder="192.168.1.100" inputmode="url" autocomplete="off">
+  </div>
+  <div class="connect-input-group">
+    <label>端口（默认 8080）</label>
+    <input class="connect-input" id="portInput" type="number" placeholder="8080" value="8080">
+  </div>
+  <div class="connect-error" id="connectError"></div>
+  <button class="connect-btn" id="connectBtn" onclick="doConnect()">连 接</button>
+</div>
+
+<!-- ===== Main Page ===== -->
+<div id="mainPage">
+
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="topbar-left">
+      <div class="cam-indicator" id="camIndicator"></div>
+      <span class="topbar-title">Camera</span>
+    </div>
+    <button class="topbar-btn" id="btnConsole" onclick="toggleConsole()" title="命令控制台">⌨</button>
+    <button class="topbar-btn" id="btnSettings" onclick="toggleSettings()" title="检测设置">⚙</button>
+    <button class="topbar-btn" id="btnInfo" onclick="toggleInfo()" title="详细信息">ℹ</button>
+    <button class="topbar-btn" id="btnDisconnect" onclick="doDisconnect()" title="断开连接" style="font-size:13px;">✕</button>
+  </div>
+
+  <!-- Video Area -->
+  <div class="video-area" id="videoArea">
+    <div class="video-container" id="videoContainer">
+      <img id="videoImg" crossorigin="anonymous">
+      <canvas id="overlayCanvas"></canvas>
+      <div id="videoTapArea"></div>
+    </div>
+    <div class="video-overlay-msg" id="videoMsg">连接中...</div>
+    <div class="cam-off-overlay" id="camOffOverlay">
+      <div class="icon">📷</div>
+      <div class="label">摄像头已关闭</div>
+      <div class="label" style="font-size:12px;opacity:.5;">请开启摄像头以查看画面</div>
+    </div>
+  </div>
+
+  <!-- Info Panel -->
+  <div class="info-panel" id="infoPanel">
+    <div class="info-card">
+      <h3>📊 设备详细信息</h3>
+      <div class="info-row"><span class="label">采集帧率</span><span class="value" id="infoFpsCapture">-- fps</span></div>
+      <div class="info-row"><span class="label">推理帧率</span><span class="value" id="infoFpsInference">-- fps</span></div>
+      <div class="info-row"><span class="label">推流帧率</span><span class="value" id="infoFpsStream">-- fps</span></div>
+      <div class="info-row"><span class="label">跟踪目标</span><span class="value" id="infoTarget">无</span></div>
+      <div class="info-row"><span class="label">WiFi 延迟</span><span class="value" id="infoLatency">-- ms</span></div>
+      <div class="info-row"><span class="label">运行时间</span><span class="value" id="infoUptime">--:--:--</span></div>
+      <div class="info-row"><span class="label">图像错误帧</span><span class="value" id="infoImageErrors">--</span></div>
+      <div class="info-row"><span class="label">I2C 写失败</span><span class="value" id="infoI2cErrors">--</span></div>
+      <div class="info-row"><span class="label">WebSocket</span><span class="value" id="infoWs">未连接</span></div>
+      <button class="info-close-btn" onclick="toggleInfo()">关闭</button>
+    </div>
+  </div>
+
+  <!-- Settings Panel -->
+  <div class="settings-panel" id="settingsPanel">
+    <div class="settings-card">
+      <h3>⚙ 检测设置</h3>
+      <div class="settings-section">
+        <div class="maxdet-row">
+          <label>检测框上限：</label>
+          <input type="number" id="maxDetInput" min="1" max="20" value="10">
+          <span style="font-size:12px;color:var(--text2);">（1-20）</span>
+        </div>
+      </div>
+      <button class="info-close-btn" onclick="applySettings()">应用并关闭</button>
+    </div>
+  </div>
+
+  <!-- Console Panel -->
+  <div class="console-panel" id="consolePanel">
+    <div class="console-log" id="consoleLog"></div>
+    <div class="console-input-row">
+      <input class="console-input" id="consoleInput" placeholder='输入 JSON 命令，如 {"enabled":true}' onkeydown="if(event.key==='Enter')sendConsoleCmd()">
+      <button class="console-send-btn" onclick="sendConsoleCmd()">发送</button>
+      <button class="console-clear-btn" onclick="clearConsole()">清</button>
+    </div>
+  </div>
+
+  <!-- Control Bar -->
+  <div class="control-bar" id="controlBar">
+    <div class="ctrl-row">
+      <button class="cam-toggle-btn off" id="btnCam" onclick="toggleCamera()">
+        <span>📷</span> <span id="btnCamLabel">CAM: OFF</span>
+      </button>
+      <button class="toggle-btn" id="btnYolo" onclick="toggleYolo()" disabled>
+        <span class="dot"></span> <span id="btnYoloLabel">检测: OFF</span>
+      </button>
+      <button class="toggle-btn" id="btnTrack" onclick="toggleTrack()" disabled>
+        <span class="dot"></span> <span id="btnTrackLabel">跟踪: OFF</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Status Bar -->
+  <div class="status-bar" id="statusBar">
+    <span class="status-item"><span class="status-dot" style="background:var(--green)"></span> 推流:--fps</span>
+    <span class="status-sep">|</span>
+    <span class="status-item"><span class="status-dot" style="background:var(--yellow)"></span> <span id="statusInference">推理:OFF</span></span>
+    <span class="status-sep">|</span>
+    <span class="status-item"><span id="statusTarget">目标:无</span></span>
+    <span class="status-sep">|</span>
+    <span class="status-item"><span id="statusWs" style="color:var(--red);">WS:断开</span></span>
+  </div>
+</div>
+
+<script>
+// ===== State =====
+let baseUrl = '';
+let wsUrl = '';
+let ws = null;
+let wsReconnectTimer = null;
+let cameraOn = false;
+let yoloEnabled = false;
+let trackingActive = false;
+let selectedTargetId = null;
+let detections = [];
+let deviceStatus = {};
+let maxDet = 10;
+let streamConnected = false;
+let lastFrameTime = 0;
+let pingSentAt = 0;     // 0: no ping outstanding
+let latency = 0;
+let wsLost = false;
+let lastUptimeSec = -1;
+let commandAt = 0;      // a status older than the last command must not undo it
+
+const PING_PERIOD_MS = 3000;
+const PONG_TIMEOUT_MS = 6000;
+const COMMAND_SETTLE_MS = 1500;
+
+// ===== Elements =====
+const $ = id => document.getElementById(id);
+
+// ===== Init =====
+function init() {
+  const savedIp = localStorage.getItem('cam_ip');
+  const savedPort = localStorage.getItem('cam_port');
+  if (savedIp) $('ipInput').value = savedIp;
+  if (savedPort) $('portInput').value = savedPort;
+  setupVideoTap();
+  window.addEventListener('resize', resizeOverlay);
+
+  setInterval(updateStatusBar, 1000);
+  setInterval(pingTick, PING_PERIOD_MS);
+}
+
+// ===== Connection =====
+function doConnect() {
+  const ip = $('ipInput').value.trim();
+  const port = $('portInput').value.trim() || '8080';
+  if (!ip) { $('connectError').textContent = '请输入设备 IP 地址'; return; }
+
+  $('connectBtn').disabled = true;
+  $('connectError').textContent = '连接中...';
+  baseUrl = `http://${ip}:${port}`;
+  wsUrl = `ws://${ip}:${port}/ws`;
+
+  // Test connection with status API
+  fetch(`${baseUrl}/api/status`, { signal: AbortSignal.timeout(5000) })
+    .then(r => r.json())
+    .then(data => {
+      // === 保存到localStorage（原代码）===
+      localStorage.setItem('cam_ip', ip);
+      localStorage.setItem('cam_port', port);
+
+      // === 【新增】保存到Android原生存储 ===
+      if (window.AndroidBridge && window.AndroidBridge.saveDeviceAddress) {
+        window.AndroidBridge.saveDeviceAddress(ip, port);
+      }
+
+      $('connectPage').style.display = 'none';
+      $('mainPage').style.display = 'flex';
+      addLog('info', `已连接到 ${baseUrl}`);
+
+      // Apply status from device
+      if (data.status) applyDeviceStatus(data.status);
+
+      connectWebSocket();
+    })
+    .catch(err => {
+      $('connectError').textContent = `连接失败: ${err.message || '无法访问设备'}`;
+      $('connectBtn').disabled = false;
+    });
+}
+
+function doDisconnect() {
+  if (ws) { ws.close(); ws = null; }
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  setCamera(false);
+  lastUptimeSec = -1;
+  wsLost = false;
+  pingSentAt = 0;
+  $('mainPage').style.display = 'none';
+  $('connectPage').style.display = 'flex';
+  $('connectBtn').disabled = false;
+  $('connectError').textContent = '';
+  closeAllPanels();
+  addLog('info', '已断开连接');
+
+  // === 显示断开连接的提示 ===
+  if (window.AndroidBridge && window.AndroidBridge.showToast) {
+    window.AndroidBridge.showToast('已断开连接');
+  }
+}
+
+// ===== WebSocket =====
+function connectWebSocket() {
+  if (ws) { ws.close(); ws = null; }
+
+  let sock;
+  try {
+    sock = new WebSocket(wsUrl);
+  } catch(e) {
+    addLog('error', `WebSocket 创建失败: ${e.message}`);
+    scheduleWsReconnect();
+    return;
+  }
+  ws = sock;
+  pingSentAt = 0;
+
+  sock.onopen = () => {
+    addLog('info', 'WebSocket 已连接');
+    $('statusWs').textContent = 'WS:已连接';
+    $('statusWs').style.color = 'var(--green)';
+    $('infoWs').textContent = '已连接';
+    $('infoWs').style.color = 'var(--green)';
+    // An <img> showing a multipart stream does not report that the stream ended.
+    if (wsLost && cameraOn) startStream();
+    wsLost = false;
+    pingTick();
+  };
+
+  sock.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.pong !== undefined) {
+        latency = Date.now() - pingSentAt;
+        pingSentAt = 0;
+        $('infoLatency').textContent = latency + ' ms';
+        return;
+      }
+      handleWsMessage(msg);
+    } catch(e) {
+      addLog('error', `WS 消息解析错误: ${e.message}`);
+    }
+  };
+
+  sock.onclose = () => {
+    if (ws !== sock) return;  // replaced by a newer connection
+    addLog('info', 'WebSocket 断开');
+    wsLost = true;
+    $('statusWs').textContent = 'WS:断开';
+    $('statusWs').style.color = 'var(--red)';
+    $('infoWs').textContent = '断开';
+    $('infoWs').style.color = 'var(--red)';
+    scheduleWsReconnect();
+  };
+
+  sock.onerror = () => {};
+}
+
+function scheduleWsReconnect() {
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  wsReconnectTimer = setTimeout(() => {
+    if ($('mainPage').style.display !== 'none') {
+      addLog('info', 'WebSocket 重连中...');
+      connectWebSocket();
+    }
+  }, 3000);
+}
+
+// A network that goes away closes nothing: only a missing pong shows it.
+function pingTick() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (pingSentAt) {
+    if (Date.now() - pingSentAt > PONG_TIMEOUT_MS) {
+      addLog('info', 'WebSocket 无响应，重新连接');
+      pingSentAt = 0;
+      ws.close();
+    }
+    return;
+  }
+  pingSentAt = Date.now();
+  ws.send(JSON.stringify({ ping: pingSentAt }));
+}
+
+function handleWsMessage(msg) {
+  // Detection results arrive at 30 Hz: log them only while someone is reading.
+  if ($('consolePanel').classList.contains('show')) {
+    const logStr = JSON.stringify(msg);
+    addLog('recv', logStr.length > 300 ? logStr.substring(0, 300) + '...' : logStr);
+  }
+
+  if (msg.detections !== undefined) {
+    detections = msg.detections || [];
+    drawDetections();
+  }
+
+  if (msg.status) {
+    applyDeviceStatus(msg.status);
+  }
+}
+
+function applyDeviceStatus(s) {
+  deviceStatus = s;
+
+  // A process restart puts the board back to its defaults; what the user asked for still stands.
+  const restarted = s.uptime_sec !== undefined && s.uptime_sec < lastUptimeSec;
+  if (s.uptime_sec !== undefined) lastUptimeSec = s.uptime_sec;
+  if (restarted) {
+    addLog('info', '设备已重启，恢复摄像头和检测状态');
+    commandAt = Date.now();
+    if (cameraOn) apiPost('/api/camera', { enabled: true });
+    if (yoloEnabled) apiPost('/api/yolo', { enabled: true });
+  }
+
+  if (Date.now() - commandAt > COMMAND_SETTLE_MS) {
+    if (s.cam_enabled !== undefined && s.cam_enabled !== cameraOn) setCamera(s.cam_enabled);
+    if (s.yolo_enabled !== undefined) {
+      yoloEnabled = s.yolo_enabled;
+      updateYoloBtn();
+    }
+    if (s.tracking !== undefined) {
+      // The board ended tracking: the target is gone.  A selection alone has no target_id yet.
+      if (trackingActive && !s.tracking) selectedTargetId = null;
+      trackingActive = s.tracking;
+      updateTrackBtn();
+    }
+  }
+  if (s.target_id !== undefined && s.target_id !== null) {
+    selectedTargetId = s.target_id;
+  }
+
+  // Update info panel
+  if (s.fps_capture !== undefined) $('infoFpsCapture').textContent = s.fps_capture.toFixed(1) + ' fps';
+  if (s.fps_inference !== undefined) $('infoFpsInference').textContent = yoloEnabled ? s.fps_inference.toFixed(1) + ' fps' : 'OFF';
+  if (s.fps_stream !== undefined) $('infoFpsStream').textContent = s.fps_stream.toFixed(1) + ' fps';
+  if (s.uptime_sec !== undefined) $('infoUptime').textContent = formatUptime(s.uptime_sec);
+  if (s.dvp_bad_frames !== undefined) {
+    showCount('infoImageErrors', Math.max(s.dvp_bad_frames, 0) + s.v4l2_error_frames);
+    showCount('infoI2cErrors', Math.max(s.i2c_write_failures, 0));
+  }
+
+  updateInfoTarget();
+  updateStatusBar();
+}
+
+function showCount(id, count) {
+  $(id).textContent = count;
+  $(id).style.color = count > 0 ? 'var(--red)' : '';
+}
+
+// ===== Camera ON/OFF =====
+function toggleCamera() {
+  const detecting = yoloEnabled;
+  const tracking = trackingActive;
+
+  commandAt = Date.now();
+  setCamera(!cameraOn);
+  apiPost('/api/camera', { enabled: cameraOn });
+
+  if (!cameraOn) {
+    if (detecting) apiPost('/api/yolo', { enabled: false });
+    if (tracking) apiPost('/api/track', { action: 'stop' });
+  }
+}
+
+// Shows the camera as the user set it or as the board reports it.
+function setCamera(on) {
+  cameraOn = on;
+  updateCameraBtn();
+
+  if (on) {
+    startStream();
+    $('camOffOverlay').style.display = 'none';
+    $('btnYolo').disabled = false;
+    $('camIndicator').classList.add('on');
+  } else {
+    stopStream();
+    $('camOffOverlay').style.display = 'flex';
+
+    // Camera off → disable everything
+    yoloEnabled = false;
+    trackingActive = false;
+    selectedTargetId = null;
+    detections = [];
+    drawDetections();
+    updateYoloBtn();
+    updateTrackBtn();
+    $('btnYolo').disabled = true;
+    $('btnTrack').disabled = true;
+    $('camIndicator').classList.remove('on');
+  }
+}
+
+function updateCameraBtn() {
+  const btn = $('btnCam');
+  const label = $('btnCamLabel');
+  if (cameraOn) {
+    btn.classList.remove('off');
+    label.textContent = 'CAM: ON';
+  } else {
+    btn.classList.add('off');
+    label.textContent = 'CAM: OFF';
+  }
+}
+
+// ===== MJPEG Stream =====
+let streamImg = null;
+
+function startStream() {
+  const img = $('videoImg');
+  img.onload = () => {
+    streamConnected = true;
+    $('videoMsg').style.display = 'none';
+    resizeOverlay();
+  };
+  img.onerror = () => {
+    if (cameraOn) {
+      streamConnected = false;
+      $('videoMsg').textContent = '视频连接中...';
+      $('videoMsg').style.display = 'block';
+      // Retry after a delay
+      setTimeout(() => {
+        if (cameraOn) {
+          img.src = '';
+          img.src = baseUrl + '/stream?t=' + Date.now();
+        }
+      }, 2000);
+    }
+  };
+  img.src = baseUrl + '/stream?t=' + Date.now();
+  $('videoMsg').textContent = '连接中...';
+  $('videoMsg').style.display = 'block';
+}
+
+function stopStream() {
+  const img = $('videoImg');
+  img.onload = null;
+  img.onerror = null;
+  img.src = '';
+  streamConnected = false;
+  $('videoMsg').style.display = 'none';
+  clearCanvas();
+}
+
+// ===== Canvas Overlay =====
+function resizeOverlay() {
+  const img = $('videoImg');
+  const canvas = $('overlayCanvas');
+  const tap = $('videoTapArea');
+  if (!img.naturalWidth) return;
+
+  const rect = img.getBoundingClientRect();
+  const container = $('videoContainer');
+  container.style.width = rect.width + 'px';
+  container.style.height = rect.height + 'px';
+
+  canvas.width = rect.width;
+  canvas.height = rect.height;
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = rect.height + 'px';
+
+  tap.style.width = rect.width + 'px';
+  tap.style.height = rect.height + 'px';
+
+  drawDetections();
+}
+
+function clearCanvas() {
+  const canvas = $('overlayCanvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawDetections() {
+  const canvas = $('overlayCanvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!yoloEnabled || !detections || detections.length === 0) return;
+
+  const scaleX = canvas.width / 640;
+  const scaleY = canvas.height / 480;
+
+  detections.forEach(det => {
+    const [x, y, w, h] = det.bbox;
+    const sx = x * scaleX;
+    const sy = y * scaleY;
+    const sw = w * scaleX;
+    const sh = h * scaleY;
+
+    const isTarget = det.is_target || det.id === selectedTargetId;
+    const color = isTarget ? '#ff4d6a' : '#4f8cff';
+
+    // Box
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sx, sy, sw, sh);
+
+    // Label background
+    const label = `${det.class_name} ${(det.confidence * 100).toFixed(0)}%`;
+    ctx.font = `bold ${Math.max(10, 12 * scaleX)}px sans-serif`;
+    const tm = ctx.measureText(label);
+    const lh = Math.max(14, 16 * scaleY);
+    ctx.fillStyle = color;
+    ctx.fillRect(sx, sy - lh, tm.width + 8, lh);
+
+    // Label text
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, sx + 4, sy - 4);
+
+    // Target marker
+    if (isTarget) {
+      ctx.strokeStyle = '#ff4d6a';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.strokeRect(sx - 3, sy - 3, sw + 6, sh + 6);
+      ctx.setLineDash([]);
+    }
+  });
+}
+
+// ===== Video Tap (Target Selection) =====
+function setupVideoTap() {
+  const tap = $('videoTapArea');
+
+  tap.addEventListener('click', (e) => {
+    if (!yoloEnabled || !cameraOn) return;
+    if (!detections || detections.length === 0) return;
+
+    const rect = tap.getBoundingClientRect();
+    const clickX = (e.clientX - rect.left) / rect.width * 640;
+    const clickY = (e.clientY - rect.top) / rect.height * 480;
+
+    // Find which detection was clicked
+    let hit = null;
+    for (const det of detections) {
+      const [bx, by, bw, bh] = det.bbox;
+      if (clickX >= bx && clickX <= bx + bw && clickY >= by && clickY <= by + bh) {
+        hit = det;
+      }
+    }
+
+    if (hit) {
+      selectedTargetId = hit.id;
+      addLog('info', `选中目标: ${hit.class_name} (ID:${hit.id})`);
+      apiPost('/api/track', { action: 'select', target_id: hit.id });
+      drawDetections();
+      updateTrackBtn();
+      updateInfoTarget();
+      updateStatusBar();
+    }
+  });
+}
+
+// ===== Detection Toggle =====
+function toggleYolo() {
+  if (!cameraOn) return;
+  commandAt = Date.now();
+  yoloEnabled = !yoloEnabled;
+  apiPost('/api/yolo', { enabled: yoloEnabled });
+  updateYoloBtn();
+
+  if (!yoloEnabled) {
+    // Detection off → stop tracking, clear target, clear detections
+    if (trackingActive) {
+      trackingActive = false;
+      apiPost('/api/track', { action: 'stop' });
+    }
+    selectedTargetId = null;
+    detections = [];
+    drawDetections();
+    updateTrackBtn();
+    updateInfoTarget();
+    updateStatusBar();
+  }
+}
+
+function updateYoloBtn() {
+  const btn = $('btnYolo');
+  const label = $('btnYoloLabel');
+  btn.classList.remove('on', 'on-red');
+  if (yoloEnabled) {
+    btn.classList.add('on');
+    label.textContent = '检测: ON';
+  } else {
+    label.textContent = '检测: OFF';
+  }
+}
+
+// ===== Track Toggle =====
+function toggleTrack() {
+  if (!cameraOn || !yoloEnabled || selectedTargetId === null) return;
+  commandAt = Date.now();
+  trackingActive = !trackingActive;
+  if (trackingActive) {
+    apiPost('/api/track', { action: 'start' });
+  } else {
+    apiPost('/api/track', { action: 'stop' });
+  }
+  updateTrackBtn();
+}
+
+function updateTrackBtn() {
+  const btn = $('btnTrack');
+  const label = $('btnTrackLabel');
+  btn.classList.remove('on', 'on-red');
+
+  if (!cameraOn || !yoloEnabled || selectedTargetId === null) {
+    btn.disabled = true;
+    label.textContent = '跟踪: OFF';
+    trackingActive = false;
+  } else {
+    btn.disabled = false;
+    if (trackingActive) {
+      btn.classList.add('on-red');
+      label.textContent = '跟踪: ON';
+    } else {
+      label.textContent = '跟踪: OFF';
+    }
+  }
+}
+
+// ===== Settings =====
+function applySettings() {
+  maxDet = Math.max(1, Math.min(20, parseInt($('maxDetInput').value) || 10));
+  $('maxDetInput').value = maxDet;
+  apiPost('/api/settings', { max_det: maxDet });
+  addLog('info', `设置已应用: max_det=${maxDet}`);
+  toggleSettings();
+}
+
+// ===== Panel Toggles =====
+function closeAllPanels() {
+  $('infoPanel').classList.remove('show');
+  $('settingsPanel').classList.remove('show');
+  $('consolePanel').classList.remove('show');
+  $('btnInfo').classList.remove('active');
+  $('btnSettings').classList.remove('active');
+  $('btnConsole').classList.remove('active');
+}
+
+function toggleInfo() {
+  const open = $('infoPanel').classList.contains('show');
+  closeAllPanels();
+  if (!open) {
+    $('infoPanel').classList.add('show');
+    $('btnInfo').classList.add('active');
+  }
+}
+
+function toggleSettings() {
+  const open = $('settingsPanel').classList.contains('show');
+  closeAllPanels();
+  if (!open) {
+    $('settingsPanel').classList.add('show');
+    $('btnSettings').classList.add('active');
+  }
+}
+
+function toggleConsole() {
+  const open = $('consolePanel').classList.contains('show');
+  closeAllPanels();
+  if (!open) {
+    $('consolePanel').classList.add('show');
+    $('btnConsole').classList.add('active');
+  }
+}
+
+// ===== Status Bar =====
+function updateStatusBar() {
+  const bar = $('statusBar');
+  const fpsStream = deviceStatus.fps_stream !== undefined ? deviceStatus.fps_stream.toFixed(0) : '--';
+  const fpsInf = yoloEnabled && deviceStatus.fps_inference !== undefined ? deviceStatus.fps_inference.toFixed(1) : 'OFF';
+
+  let targetStr = '无';
+  if (selectedTargetId !== null && detections.length > 0) {
+    const t = detections.find(d => d.id === selectedTargetId);
+    if (t) targetStr = t.class_name;
+  }
+
+  bar.innerHTML = `
+    <span class="status-item"><span class="status-dot" style="background:var(--green)"></span> 推流:${fpsStream}fps</span>
+    <span class="status-sep">|</span>
+    <span class="status-item"><span class="status-dot" style="background:var(--yellow)"></span> 推理:${fpsInf}</span>
+    <span class="status-sep">|</span>
+    <span class="status-item">目标:${targetStr}</span>
+    <span class="status-sep">|</span>
+    <span class="status-item" id="statusWs" style="color:${ws && ws.readyState===WebSocket.OPEN ? 'var(--green)' : 'var(--red)'};">WS:${ws && ws.readyState===WebSocket.OPEN ? '已连接' : '断开'}</span>
+  `;
+}
+
+function updateInfoTarget() {
+  let targetStr = '无';
+  if (selectedTargetId !== null && detections.length > 0) {
+    const t = detections.find(d => d.id === selectedTargetId);
+    if (t) targetStr = `${t.class_name} (${(t.confidence * 100).toFixed(0)}%)`;
+  }
+  $('infoTarget').textContent = targetStr;
+}
+
+function formatUptime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// ===== Console / Log =====
+const MAX_LOG_ENTRIES = 500;
+let logEntries = [];
+
+function addLog(type, text) {
+  const now = new Date();
+  const ts = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}.${String(now.getMilliseconds()).padStart(3,'0')}`;
+  logEntries.push({ type, text, ts });
+  if (logEntries.length > MAX_LOG_ENTRIES) logEntries.shift();
+
+  const logEl = $('consoleLog');
+  if (!logEl) return;
+
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${type}`;
+  entry.textContent = `[${ts}] ${text}`;
+  logEl.appendChild(entry);
+
+  // Trim DOM
+  while (logEl.children.length > MAX_LOG_ENTRIES) {
+    logEl.removeChild(logEl.firstChild);
+  }
+
+  // Auto-scroll
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function clearConsole() {
+  logEntries = [];
+  $('consoleLog').innerHTML = '';
+}
+
+function sendConsoleCmd() {
+  const input = $('consoleInput');
+  const raw = input.value.trim();
+  if (!raw) return;
+
+  addLog('sent', raw);
+  input.value = '';
+
+  // Try to parse as JSON and determine endpoint
+  try {
+    const parsed = JSON.parse(raw);
+    // Smart routing based on keys
+    let endpoint = '/api/status';
+    if (parsed.enabled !== undefined) endpoint = '/api/yolo';
+    else if (parsed.action !== undefined) endpoint = '/api/track';
+    else if (parsed.max_det !== undefined) endpoint = '/api/settings';
+    else if (parsed.endpoint) { endpoint = parsed.endpoint; delete parsed.endpoint; }
+
+    addLog('info', `→ POST ${endpoint}`);
+    apiPost(endpoint, parsed);
+  } catch (e) {
+    // If not JSON, try sending via WebSocket
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(raw);
+      addLog('info', '通过 WebSocket 发送');
+    } else {
+      addLog('error', '无效 JSON 且 WebSocket 未连接');
+    }
+  }
+}
+
+// ===== API Helper =====
+function apiPost(endpoint, data) {
+  const body = JSON.stringify(data);
+  addLog('sent', `POST ${endpoint} ${body}`);
+
+  fetch(baseUrl + endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body,
+    signal: AbortSignal.timeout(5000)
+  })
+  .then(r => r.json())
+  .then(resp => {
+    addLog('recv', `${endpoint} → ${JSON.stringify(resp)}`);
+  })
+  .catch(err => {
+    addLog('error', `${endpoint} 错误: ${err.message}`);
+  });
+}
+
+// ===== Start =====
+init();
+</script>
+</body>
+</html>

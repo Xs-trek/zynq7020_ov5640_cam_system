@@ -1,6 +1,8 @@
 #include "ultraface_decode.h"
 
+#include <limits.h>
 #include <math.h>
+#include <string.h>
 
 typedef struct {
     float x1;
@@ -32,7 +34,7 @@ static int uf_candidate_precedes(float score, uint16_t prior_index,
 static void uf_insert_candidate(uf_candidate_t *items, size_t *count,
                                 const uf_candidate_t *candidate)
 {
-    size_t position = 0u;
+    size_t position = *count;
     size_t limit = *count;
 
     if (limit > UF_CANDIDATE_LIMIT) {
@@ -71,6 +73,55 @@ static float uf_iou(const uf_candidate_t *lhs, const uf_candidate_t *rhs)
     const float rh = rhs->y2 > rhs->y1 ? rhs->y2 - rhs->y1 : 0.0f;
     const float intersection = iw * ih;
     return intersection / (lw * lh + rw * rh - intersection + 1.0e-6f);
+}
+
+static uint64_t uf_fnv1a64_update(uint64_t hash,
+                                  const uint8_t *data,
+                                  size_t size)
+{
+    const uint64_t prime = UINT64_C(1099511628211);
+    for (size_t index = 0u; index < size; ++index) {
+        hash ^= (uint64_t)data[index];
+        hash *= prime;
+    }
+    return hash;
+}
+
+int uf_summarize_tensors_s8(const int8_t *scores,
+                            const int8_t *boxes,
+                            uf_tensor_summary_t *summary)
+{
+    int top_delta = INT_MIN;
+    uint16_t top_prior = 0u;
+    uint64_t hash = UINT64_C(14695981039346656037);
+
+    if (scores == NULL || boxes == NULL || summary == NULL) {
+        return -1;
+    }
+
+    hash = uf_fnv1a64_update(hash, (const uint8_t *)scores, UF_SCORE_BYTES);
+    hash = uf_fnv1a64_update(hash, (const uint8_t *)boxes, UF_BOX_BYTES);
+
+    for (uint16_t prior = 0u; prior < UF_PRIOR_COUNT; ++prior) {
+        const int delta = (int)scores[2u * prior + 1u] -
+                          (int)scores[2u * prior];
+        if (delta > top_delta) {
+            top_delta = delta;
+            top_prior = prior;
+        }
+    }
+
+    memset(summary, 0, sizeof(*summary));
+    summary->tensor_hash = hash;
+    summary->top_confidence = 1.0f /
+        (1.0f + expf(-(float)top_delta * UF_SCORE_SCALE));
+    summary->top_prior_index = top_prior;
+    summary->top_background_q = scores[2u * top_prior];
+    summary->top_face_q = scores[2u * top_prior + 1u];
+    for (size_t coordinate = 0u; coordinate < 4u; ++coordinate) {
+        summary->top_box_q[coordinate] = boxes[4u * top_prior + coordinate];
+    }
+    return 0;
 }
 
 int uf_decode_nms_s8(const int8_t *scores,

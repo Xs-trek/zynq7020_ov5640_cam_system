@@ -5,10 +5,13 @@
  * A delayed detector result is transformed with the view metadata captured with
  * that frame, corrected at its observation time, then replayed to the present.
  */
+#define LOG_TAG "tracker"
+
 #include "cam_system/tracker.h"
 #include "platform/hal_ov5640.h"
 #include "cam_system/config.h"
 #include "control/tracker_servo.h"
+#include "common/log.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -73,23 +76,17 @@ static int clampi(int v, int lo, int hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static int env_flag_enabled(const char *name)
+void tracker_set_diagnostics(int verbose, float diag_every_sec)
 {
-    const char *value = getenv(name);
-    return value && value[0] != '\0' && strcmp(value, "0") != 0;
+    tracker_verbose_log = verbose != 0;
+    tracker_diag_interval_sec = diag_every_sec > 0.0f ? diag_every_sec : 0.0f;
 }
 
 static void tracker_load_config(void)
 {
-    const char *diag = getenv("CAM_TRACKER_DIAG_EVERY");
-
-    tracker_verbose_log = env_flag_enabled("CAM_TRACKER_VERBOSE");
-    tracker_diag_interval_sec = diag ? strtof(diag, NULL) : 0.0f;
-    if (tracker_diag_interval_sec < 0.0f)
-        tracker_diag_interval_sec = 0.0f;
-    /* The release has one validated behavior.  Environment variables remain
-     * diagnostics-only so board testing cannot silently become a parameter
-     * sweep with an unrecorded controller/association variant. */
+    /* The release has one validated behavior.  Configuration only switches
+     * diagnostics (tracker_set_diagnostics) so board testing cannot silently
+     * become a parameter sweep with an unrecorded controller/association variant. */
     tracker_q_xy = TRACK_KF_ACCEL_VAR_XY;
     tracker_q_scale = TRACK_KF_ACCEL_VAR_SCALE;
     tracker_nis_gate = TRACK_ASSOC_NIS_GATE;
@@ -125,7 +122,7 @@ static void notify_status_changed(void)
     app_state_inc_u32(&g_state.status_seq);
 }
 
-static const char *state_name(track_state_t state)
+const char *tracker_state_name(track_state_t state)
 {
     switch (state) {
     case TRACK_STATE_IDLE: return "IDLE";
@@ -156,12 +153,12 @@ static void set_state(tracker_t *trk, track_state_t state)
         trk->view.reference_y.pos = trk->view.y.pos;
         trk->view.reference_y.vel = 0.0f;
     }
-    printf("[tracker] -> %s\n", state_name(state));
+    LOG_I("-> %s", tracker_state_name(state));
     notify_status_changed();
 }
 
-static void det_to_abs(const detection_t *det, const frame_view_t *view,
-                       float *cx, float *cy, float *width, float *height)
+void tracker_det_to_abs(const detection_t *det, const frame_view_t *view,
+                        float *cx, float *cy, float *width, float *height)
 {
     float u = det->bbox[0] + det->bbox[2] * 0.5f;
     /* A point just above the box centre is materially more stable for a face:
@@ -426,11 +423,8 @@ int tracker_write_isp_offset(int x, int y)
         return -1;
     if (requested_x == last_written_xoff && requested_y == last_written_yoff)
         return 0;
-    if (ov5640_apply_isp_offset(requested_x, requested_y) < 0) {
-        fprintf(stderr, "[tracker] ISP offset write failed (%d,%d)\n",
-                requested_x, requested_y);
-        return -1;
-    }
+    if (ov5640_apply_isp_offset(requested_x, requested_y) < 0)
+        return -1;  /* logged (rate-limited) by the OV5640 HAL */
     current_xoff = requested_x;
     current_yoff = requested_y;
     last_written_xoff = requested_x;
@@ -448,6 +442,17 @@ void tracker_get_isp_offset(int *xoff, int *yoff)
 {
     *xoff = current_xoff;
     *yoff = current_yoff;
+}
+
+void tracker_sensor_initialized(void)
+{
+    scaler_disabled = 0;
+    current_xoff = ISP_DEFAULT_XOFF;
+    current_yoff = ISP_DEFAULT_YOFF;
+    /* Forget the last write, so the next offset write reaches the sensor. */
+    last_written_xoff = -1;
+    last_written_yoff = -1;
+    isp_written_this_frame = 0;
 }
 
 void tracker_snapshot_view(frame_view_t *view, int xoff, int yoff,
@@ -479,7 +484,7 @@ static int scaler_restore(void)
     if (!scaler_disabled)
         return 0;
     if (ov5640_set_scaler_enabled(1) < 0) {
-        fprintf(stderr, "[tracker] scaler restore failed\n");
+        LOG_E("scaler restore failed");
         return -1;
     }
     scaler_disabled = 0;
@@ -491,7 +496,7 @@ static int scaler_disable(void)
     if (scaler_disabled)
         return 0;
     if (ov5640_set_scaler_enabled(0) < 0) {
-        fprintf(stderr, "[tracker] scaler disable failed\n");
+        LOG_E("scaler disable failed");
         return -1;
     }
     scaler_disabled = 1;
@@ -513,36 +518,36 @@ void tracker_init(tracker_t *trk)
     last_written_xoff = -1;
     last_written_yoff = -1;
     isp_written_this_frame = 0;
-    printf("[tracker] Init timestamped-kf q_xy=%.1f nis=%.2f/%.2f "
-           "exact_gate=%.0f+%.0fpx/s<=%.0f sigma=%.1f y_var=%.1f "
-           "anchor=face%.2f/view(%.2f,%.2f) "
-           "timeouts=%.2f/%.2f/%.2f/%.2f command_coast=%.2f "
-           "trust=rebind%d private_var=%.1f/%.1f "
-           "lead=%.1fms max_step=(%.0f,%.0f) "
-           "reference=gh(%.2f,%.2f) "
-           "composer_x=band%.0f..%.0f omega%.1f vmax%.0f amax%.0f jmax%.0f "
-           "composer_y=band%.0f..%.0f omega%.1f vmax%.0f amax%.0f jmax%.0f\n",
-           tracker_q_xy, tracker_nis_gate, tracker_exact_nis_gate,
-           tracker_exact_gate_base, tracker_exact_gate_speed,
-           tracker_exact_gate_max, tracker_measurement_sigma_base,
-           TRACK_MEAS_Y_VAR_SCALE, TRACK_FACE_ANCHOR_Y_RATIO,
-           TRACK_VIEW_ANCHOR_X_RATIO, TRACK_VIEW_ANCHOR_Y_RATIO,
-           tracker_miss_grace_sec, tracker_coast_sec,
-           tracker_hold_sec, tracker_lost_sec,
-           tracker_command_coast_sec, TRACK_REBIND_CONFIRM_FRAMES,
-           TRACK_ASSOC_PRIVATE_VAR_SCALE,
-           TRACK_UNASSOCIATED_VAR_SCALE,
-           TRACK_COMMAND_LEAD_SEC * 1000.0f,
-           TRACK_VIEW_MAX_STEP_X_PX, TRACK_VIEW_MAX_STEP_Y_PX,
-           TRACK_REFERENCE_ALPHA, TRACK_REFERENCE_BETA,
-           TRACK_VIEW_NOISE_ENTER_X_MIN_PX,
-           TRACK_VIEW_NOISE_ENTER_X_MAX_PX, TRACK_VIEW_PATH_OMEGA_X,
-           TRACK_VIEW_MAX_VEL_X, TRACK_VIEW_MAX_ACCEL_X,
-           TRACK_VIEW_MAX_JERK_X,
-           TRACK_VIEW_NOISE_ENTER_Y_MIN_PX,
-           TRACK_VIEW_NOISE_ENTER_Y_MAX_PX, TRACK_VIEW_PATH_OMEGA_Y,
-           TRACK_VIEW_MAX_VEL_Y, TRACK_VIEW_MAX_ACCEL_Y,
-           TRACK_VIEW_MAX_JERK_Y);
+    LOG_I("Init timestamped-kf q_xy=%.1f nis=%.2f/%.2f "
+          "exact_gate=%.0f+%.0fpx/s<=%.0f sigma=%.1f y_var=%.1f "
+          "anchor=face%.2f/view(%.2f,%.2f) "
+          "timeouts=%.2f/%.2f/%.2f/%.2f command_coast=%.2f "
+          "trust=rebind%d private_var=%.1f/%.1f "
+          "lead=%.1fms max_step=(%.0f,%.0f) "
+          "reference=gh(%.2f,%.2f) "
+          "composer_x=band%.0f..%.0f omega%.1f vmax%.0f amax%.0f jmax%.0f "
+          "composer_y=band%.0f..%.0f omega%.1f vmax%.0f amax%.0f jmax%.0f",
+          tracker_q_xy, tracker_nis_gate, tracker_exact_nis_gate,
+          tracker_exact_gate_base, tracker_exact_gate_speed,
+          tracker_exact_gate_max, tracker_measurement_sigma_base,
+          TRACK_MEAS_Y_VAR_SCALE, TRACK_FACE_ANCHOR_Y_RATIO,
+          TRACK_VIEW_ANCHOR_X_RATIO, TRACK_VIEW_ANCHOR_Y_RATIO,
+          tracker_miss_grace_sec, tracker_coast_sec,
+          tracker_hold_sec, tracker_lost_sec,
+          tracker_command_coast_sec, TRACK_REBIND_CONFIRM_FRAMES,
+          TRACK_ASSOC_PRIVATE_VAR_SCALE,
+          TRACK_UNASSOCIATED_VAR_SCALE,
+          TRACK_COMMAND_LEAD_SEC * 1000.0f,
+          TRACK_VIEW_MAX_STEP_X_PX, TRACK_VIEW_MAX_STEP_Y_PX,
+          TRACK_REFERENCE_ALPHA, TRACK_REFERENCE_BETA,
+          TRACK_VIEW_NOISE_ENTER_X_MIN_PX,
+          TRACK_VIEW_NOISE_ENTER_X_MAX_PX, TRACK_VIEW_PATH_OMEGA_X,
+          TRACK_VIEW_MAX_VEL_X, TRACK_VIEW_MAX_ACCEL_X,
+          TRACK_VIEW_MAX_JERK_X,
+          TRACK_VIEW_NOISE_ENTER_Y_MIN_PX,
+          TRACK_VIEW_NOISE_ENTER_Y_MAX_PX, TRACK_VIEW_PATH_OMEGA_Y,
+          TRACK_VIEW_MAX_VEL_Y, TRACK_VIEW_MAX_ACCEL_Y,
+          TRACK_VIEW_MAX_JERK_Y);
 }
 
 void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
@@ -553,8 +558,8 @@ void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
     if (cmd == TRACK_CMD_SELECT) {
         frame_view_t view;
         if (tracker_is_active(trk)) {
-            printf("[tracker] SELECT rejected while %s\n",
-                   state_name(trk->state));
+            LOG_I("SELECT rejected while %s",
+                  tracker_state_name(trk->state));
             return;
         }
         trk->target_id = tid;
@@ -567,9 +572,9 @@ void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
             float width;
             if (det->track_id != tid || !det->publish)
                 continue;
-            det_to_abs(det, &view,
-                       &trk->select_abs_x, &trk->select_abs_y,
-                       &width, &trk->select_abs_h);
+            tracker_det_to_abs(det, &view,
+                               &trk->select_abs_x, &trk->select_abs_y,
+                               &width, &trk->select_abs_h);
             trk->select_aspect = width / fmaxf(trk->select_abs_h, 1.0f);
             trk->select_confidence = det->confidence;
             trk->select_time_sec = view.capture_time_sec;
@@ -582,12 +587,12 @@ void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
             trk->target_id = -1;
             trk->source_id = -1;
             set_state(trk, TRACK_STATE_IDLE);
-            printf("[tracker] SELECT failed id=%d\n", tid);
+            LOG_I("SELECT failed id=%d", tid);
         } else {
             set_state(trk, TRACK_STATE_SELECTED);
-            printf("[tracker] SELECT id=%d abs=(%.1f,%.1f) h=%.1f t=%.3f\n",
-                   tid, trk->select_abs_x, trk->select_abs_y,
-                   trk->select_abs_h, trk->select_time_sec);
+            LOG_I("SELECT id=%d abs=(%.1f,%.1f) h=%.1f t=%.3f",
+                  tid, trk->select_abs_x, trk->select_abs_y,
+                  trk->select_abs_h, trk->select_time_sec);
         }
         return;
     }
@@ -597,7 +602,7 @@ void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
         int initial_y;
         if (trk->state != TRACK_STATE_SELECTED ||
             !trk->select_valid || trk->target_id < 0) {
-            printf("[tracker] Cannot start: no valid selection\n");
+            LOG_I("Cannot start: no valid selection");
             return;
         }
         initial_x = clampi((int)lroundf(
@@ -647,14 +652,14 @@ void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid)
         app_state_store_int(&g_state.tracking_active, 1);
         app_state_store_int(&g_state.tracking_target_id, trk->target_id);
         notify_status_changed();
-        printf("[tracker] START id=%d off=(%d,%d)\n",
-               trk->target_id, initial_x, initial_y);
+        LOG_I("START id=%d off=(%d,%d)",
+              trk->target_id, initial_x, initial_y);
         return;
     }
 
     if (cmd == TRACK_CMD_STOP) {
         tracker_stop(trk);
-        printf("[tracker] Stopped by user\n");
+        LOG_I("Stopped by user");
     }
 }
 
@@ -780,7 +785,7 @@ static int find_best_detection(tracker_t *trk, detection_t *dets, int count,
             continue;
         if (exact)
             diag->exact_seen = 1;
-        det_to_abs(&dets[i], view, &x, &y, &width, &height);
+        tracker_det_to_abs(&dets[i], view, &x, &y, &width, &height);
         if (height < 2.0f || width < 2.0f)
             continue;
         measurement_variance(&dets[i], view, height,
@@ -924,23 +929,23 @@ void tracker_update_detections(tracker_t *trk,
         }
         if (tracker_verbose_log) {
             if (association_diag.exact_seen) {
-                printf("[tracker] reject exact id_misses=%d candidates=%d "
-                       "nis=%.1f/%.1f dist=%.1f/%.1f ratio=%.2f\n",
-                       trk->id_miss_count, det_count,
-                       association_diag.exact_nis,
-                       tracker_exact_nis_gate,
-                       association_diag.exact_distance,
-                       association_diag.exact_distance_gate,
-                       association_diag.exact_scale_ratio);
+                LOG_I("reject exact id_misses=%d candidates=%d "
+                      "nis=%.1f/%.1f dist=%.1f/%.1f ratio=%.2f",
+                      trk->id_miss_count, det_count,
+                      association_diag.exact_nis,
+                      tracker_exact_nis_gate,
+                      association_diag.exact_distance,
+                      association_diag.exact_distance_gate,
+                      association_diag.exact_scale_ratio);
             } else {
-                printf("[tracker] no association id_misses=%d candidates=%d "
-                       "rebuild=%d nis=%.1f dist=%.1f iou=%.2f ratio=%.2f\n",
-                       trk->id_miss_count, det_count,
-                       association_diag.rebuild_seen,
-                       association_diag.rebuild_nis,
-                       association_diag.rebuild_distance,
-                       association_diag.rebuild_iou,
-                       association_diag.rebuild_scale_ratio);
+                LOG_I("no association id_misses=%d candidates=%d "
+                      "rebuild=%d nis=%.1f dist=%.1f iou=%.2f ratio=%.2f",
+                      trk->id_miss_count, det_count,
+                      association_diag.rebuild_seen,
+                      association_diag.rebuild_nis,
+                      association_diag.rebuild_distance,
+                      association_diag.rebuild_iou,
+                      association_diag.rebuild_scale_ratio);
             }
         }
         return;
@@ -961,26 +966,26 @@ void tracker_update_detections(tracker_t *trk,
                 set_state(trk, TRACK_STATE_LOST);
             }
             if (tracker_verbose_log) {
-                printf("[tracker] provisional logical=%d source=%d "
-                       "candidate=%d public=%d hits=%d/%d positive=%d/%d "
-                       "dist=%.1f/%.1f nis=%.1f\n",
-                       trk->target_id, trk->source_id,
-                       dets[best].track_id, dets[best].publish,
-                       trk->rebind_hits, TRACK_REBIND_CONFIRM_FRAMES,
-                       trk->rebind_positive_hits,
-                       TRACK_REBIND_CONFIRM_FRAMES,
-                       accepted_distance, accepted_distance_gate,
-                       accepted_nis);
+                LOG_I("provisional logical=%d source=%d "
+                      "candidate=%d public=%d hits=%d/%d positive=%d/%d "
+                      "dist=%.1f/%.1f nis=%.1f",
+                      trk->target_id, trk->source_id,
+                      dets[best].track_id, dets[best].publish,
+                      trk->rebind_hits, TRACK_REBIND_CONFIRM_FRAMES,
+                      trk->rebind_positive_hits,
+                      TRACK_REBIND_CONFIRM_FRAMES,
+                      accepted_distance, accepted_distance_gate,
+                      accepted_nis);
             }
             return;
         }
         if (dets[best].track_id >= 0 && dets[best].publish &&
             trk->rebind_source_id == dets[best].track_id &&
             trk->rebind_positive_hits >= TRACK_REBIND_CONFIRM_FRAMES) {
-            printf("[tracker] detector source rebound logical=%d source=%d->%d "
-                   "hits=%d\n",
-                   trk->target_id, trk->source_id, dets[best].track_id,
-                   trk->rebind_hits);
+            LOG_I("detector source rebound logical=%d source=%d->%d "
+                  "hits=%d",
+                  trk->target_id, trk->source_id, dets[best].track_id,
+                  trk->rebind_hits);
             trk->source_id = dets[best].track_id;
             strong_identity = 1;
             reset_rebind_candidate(trk);
@@ -1038,20 +1043,20 @@ void tracker_update_detections(tracker_t *trk,
     app_state_store_int(&g_state.tracking_target_id, trk->target_id);
 
     if (tracker_verbose_log) {
-        printf("[tracker] update logical=%d source=%d public=%d conf=%.3f "
-               "obs=(%.1f,%.1f) est=(%.1f,%.1f) vel=(%.1f,%.1f) "
-               "assoc=%s trust=%s nis=%.1f dist=%.1f/%.1f "
-               "robust=(%.1f,%.1f) "
-               "age=%.1fms\n",
-               trk->target_id, trk->source_id,
-               dets[best].publish, dets[best].confidence,
-               x, y, trk->kf.x.pos, trk->kf.y.pos,
-               trk->kf.x.vel, trk->kf.y.vel,
-               matched_exact ? "exact" : "provisional",
-               strong_identity ? "strong" : "weak",
-               accepted_nis, accepted_distance, accepted_distance_gate,
-               innovation_used_x, innovation_used_y,
-               (now_sec - measurement_time) * 1000.0);
+        LOG_I("update logical=%d source=%d public=%d conf=%.3f "
+              "obs=(%.1f,%.1f) est=(%.1f,%.1f) vel=(%.1f,%.1f) "
+              "assoc=%s trust=%s nis=%.1f dist=%.1f/%.1f "
+              "robust=(%.1f,%.1f) "
+              "age=%.1fms",
+              trk->target_id, trk->source_id,
+              dets[best].publish, dets[best].confidence,
+              x, y, trk->kf.x.pos, trk->kf.y.pos,
+              trk->kf.x.vel, trk->kf.y.vel,
+              matched_exact ? "exact" : "provisional",
+              strong_identity ? "strong" : "weak",
+              accepted_nis, accepted_distance, accepted_distance_gate,
+              innovation_used_x, innovation_used_y,
+              (now_sec - measurement_time) * 1000.0);
     }
 }
 
@@ -1073,7 +1078,7 @@ static int update_timeout_state(tracker_t *trk, double now_sec)
         return 1;
     }
     if (age > tracker_lost_sec) {
-        printf("[tracker] lost timeout %.3fs\n", age);
+        LOG_I("lost timeout %.3fs", age);
         tracker_stop(trk);
         return 0;
     }
@@ -1092,6 +1097,98 @@ static int update_timeout_state(tracker_t *trk, double now_sec)
         set_state(trk, TRACK_STATE_LOST);
     }
     return 1;
+}
+
+/* Motion of the view since the last report: spread, largest step and its first two differences. */
+static void tracker_update_diagnostics(tracker_t *trk, int output_x, int output_y, double time_sec)
+{
+    diag_count++;
+    {
+        double dx = output_x - diag_mean_x;
+        double dy = output_y - diag_mean_y;
+        diag_mean_x += dx / diag_count;
+        diag_mean_y += dy / diag_count;
+        diag_m2_x += dx * (output_x - diag_mean_x);
+        diag_m2_y += dy * (output_y - diag_mean_y);
+    }
+    if (diag_last_x >= 0) {
+        int step_x = output_x - diag_last_x;
+        int step_y = output_y - diag_last_y;
+        int jump = abs(step_x);
+        int jump_y = abs(step_y);
+        if (jump_y > jump)
+            jump = jump_y;
+        if (jump > diag_max_jump)
+            diag_max_jump = jump;
+        if (diag_have_step) {
+            int delta_x = step_x - diag_last_step_x;
+            int delta_y = step_y - diag_last_step_y;
+            if (abs(delta_x) > diag_max_delta_x)
+                diag_max_delta_x = abs(delta_x);
+            if (abs(delta_y) > diag_max_delta_y)
+                diag_max_delta_y = abs(delta_y);
+            if (diag_have_delta) {
+                int jerk_x = delta_x - diag_last_delta_x;
+                int jerk_y = delta_y - diag_last_delta_y;
+                if (abs(jerk_x) > diag_max_jerk_x)
+                    diag_max_jerk_x = abs(jerk_x);
+                if (abs(jerk_y) > diag_max_jerk_y)
+                    diag_max_jerk_y = abs(jerk_y);
+            }
+            diag_last_delta_x = delta_x;
+            diag_last_delta_y = delta_y;
+            diag_have_delta = 1;
+        }
+        diag_last_step_x = step_x;
+        diag_last_step_y = step_y;
+        diag_have_step = 1;
+    }
+    diag_last_x = output_x;
+    diag_last_y = output_y;
+    if (diag_last_time == 0.0)
+        diag_last_time = time_sec;
+    if (time_sec - diag_last_time >= tracker_diag_interval_sec) {
+        double std_x = diag_count > 1 ?
+                       sqrt(diag_m2_x / (diag_count - 1)) : 0.0;
+        double std_y = diag_count > 1 ?
+                       sqrt(diag_m2_y / (diag_count - 1)) : 0.0;
+        double mean_age = trk->measurement_count ?
+                          trk->measurement_age_sum_ms /
+                          (double)trk->measurement_count : 0.0;
+        LOG_I("st=%s pos=(%.1f,%.1f) vel=(%.1f,%.1f) "
+              "view=(%d,%d) view_vel=(%.1f,%.1f) "
+              "view_accel=(%.0f,%.0f) jitter=(%.2f,%.2f) jump=%d "
+              "delta=(%d,%d) jerk=(%d,%d) "
+              "measurement_age=%.1f/%.1fms n=%lu strong=%lu weak=%lu",
+              tracker_state_name(trk->state), trk->kf.x.pos, trk->kf.y.pos,
+              trk->kf.x.vel, trk->kf.y.vel,
+              output_x, output_y,
+              trk->view.x.vel, trk->view.y.vel,
+              trk->view.x.accel, trk->view.y.accel,
+              std_x, std_y, diag_max_jump,
+              diag_max_delta_x, diag_max_delta_y,
+              diag_max_jerk_x, diag_max_jerk_y,
+              mean_age, trk->measurement_age_max_ms,
+              trk->measurement_count,
+              trk->strong_measurement_count,
+              trk->weak_measurement_count);
+        diag_last_time = time_sec;
+        diag_count = 0;
+        diag_mean_x = diag_mean_y = 0.0;
+        diag_m2_x = diag_m2_y = 0.0;
+        diag_last_x = diag_last_y = -1;
+        diag_max_jump = 0;
+        diag_last_step_x = diag_last_step_y = 0;
+        diag_last_delta_x = diag_last_delta_y = 0;
+        diag_have_step = diag_have_delta = 0;
+        diag_max_delta_x = diag_max_delta_y = 0;
+        diag_max_jerk_x = diag_max_jerk_y = 0;
+        trk->measurement_count = 0;
+        trk->strong_measurement_count = 0;
+        trk->weak_measurement_count = 0;
+        trk->measurement_age_sum_ms = 0.0;
+        trk->measurement_age_max_ms = 0.0;
+    }
 }
 
 void tracker_predict(tracker_t *trk, double time_sec)
@@ -1204,95 +1301,8 @@ void tracker_predict(tracker_t *trk, double time_sec)
     }
     pthread_mutex_unlock(&g_state.pred_mutex);
 
-    if (tracker_diag_interval_sec > 0.0f) {
-        diag_count++;
-        {
-            double dx = output_x - diag_mean_x;
-            double dy = output_y - diag_mean_y;
-            diag_mean_x += dx / diag_count;
-            diag_mean_y += dy / diag_count;
-            diag_m2_x += dx * (output_x - diag_mean_x);
-            diag_m2_y += dy * (output_y - diag_mean_y);
-        }
-        if (diag_last_x >= 0) {
-            int step_x = output_x - diag_last_x;
-            int step_y = output_y - diag_last_y;
-            int jump = abs(step_x);
-            int jump_y = abs(step_y);
-            if (jump_y > jump)
-                jump = jump_y;
-            if (jump > diag_max_jump)
-                diag_max_jump = jump;
-            if (diag_have_step) {
-                int delta_x = step_x - diag_last_step_x;
-                int delta_y = step_y - diag_last_step_y;
-                if (abs(delta_x) > diag_max_delta_x)
-                    diag_max_delta_x = abs(delta_x);
-                if (abs(delta_y) > diag_max_delta_y)
-                    diag_max_delta_y = abs(delta_y);
-                if (diag_have_delta) {
-                    int jerk_x = delta_x - diag_last_delta_x;
-                    int jerk_y = delta_y - diag_last_delta_y;
-                    if (abs(jerk_x) > diag_max_jerk_x)
-                        diag_max_jerk_x = abs(jerk_x);
-                    if (abs(jerk_y) > diag_max_jerk_y)
-                        diag_max_jerk_y = abs(jerk_y);
-                }
-                diag_last_delta_x = delta_x;
-                diag_last_delta_y = delta_y;
-                diag_have_delta = 1;
-            }
-            diag_last_step_x = step_x;
-            diag_last_step_y = step_y;
-            diag_have_step = 1;
-        }
-        diag_last_x = output_x;
-        diag_last_y = output_y;
-        if (diag_last_time == 0.0)
-            diag_last_time = time_sec;
-        if (time_sec - diag_last_time >= tracker_diag_interval_sec) {
-            double std_x = diag_count > 1 ?
-                           sqrt(diag_m2_x / (diag_count - 1)) : 0.0;
-            double std_y = diag_count > 1 ?
-                           sqrt(diag_m2_y / (diag_count - 1)) : 0.0;
-            double mean_age = trk->measurement_count ?
-                              trk->measurement_age_sum_ms /
-                              (double)trk->measurement_count : 0.0;
-            printf("[tracker] st=%s pos=(%.1f,%.1f) vel=(%.1f,%.1f) "
-                   "view=(%d,%d) view_vel=(%.1f,%.1f) "
-                   "view_accel=(%.0f,%.0f) jitter=(%.2f,%.2f) jump=%d "
-                   "delta=(%d,%d) jerk=(%d,%d) "
-                   "measurement_age=%.1f/%.1fms n=%lu strong=%lu weak=%lu\n",
-                   state_name(trk->state), trk->kf.x.pos, trk->kf.y.pos,
-                   trk->kf.x.vel, trk->kf.y.vel,
-                   output_x, output_y,
-                   trk->view.x.vel, trk->view.y.vel,
-                   trk->view.x.accel, trk->view.y.accel,
-                   std_x, std_y, diag_max_jump,
-                   diag_max_delta_x, diag_max_delta_y,
-                   diag_max_jerk_x, diag_max_jerk_y,
-                   mean_age, trk->measurement_age_max_ms,
-                   trk->measurement_count,
-                   trk->strong_measurement_count,
-                   trk->weak_measurement_count);
-            diag_last_time = time_sec;
-            diag_count = 0;
-            diag_mean_x = diag_mean_y = 0.0;
-            diag_m2_x = diag_m2_y = 0.0;
-            diag_last_x = diag_last_y = -1;
-            diag_max_jump = 0;
-            diag_last_step_x = diag_last_step_y = 0;
-            diag_last_delta_x = diag_last_delta_y = 0;
-            diag_have_step = diag_have_delta = 0;
-            diag_max_delta_x = diag_max_delta_y = 0;
-            diag_max_jerk_x = diag_max_jerk_y = 0;
-            trk->measurement_count = 0;
-            trk->strong_measurement_count = 0;
-            trk->weak_measurement_count = 0;
-            trk->measurement_age_sum_ms = 0.0;
-            trk->measurement_age_max_ms = 0.0;
-        }
-    }
+    if (tracker_diag_interval_sec > 0.0f)
+        tracker_update_diagnostics(trk, output_x, output_y, time_sec);
 }
 
 int tracker_is_active(const tracker_t *trk)
@@ -1345,5 +1355,5 @@ void tracker_stop(tracker_t *trk)
     app_state_store_int(&g_state.tracking_active, 0);
     app_state_store_int(&g_state.tracking_target_id, -1);
     notify_status_changed();
-    printf("[tracker] Stopped, full view restored\n");
+    LOG_I("Stopped, full view restored");
 }

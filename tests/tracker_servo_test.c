@@ -332,7 +332,8 @@ static int test_tracking_to_brake_transition(void)
         previous_ddy = ddy;
     }
 
-    if (max_step_x > 15 || max_step_y > 10 ||
+    if (max_step_x > (int)ceilf(TRACK_VIEW_MAX_STEP_X_PX) ||
+        max_step_y > (int)ceilf(TRACK_VIEW_MAX_STEP_Y_PX) ||
         max_delta_x > 3 || max_delta_y > 3 ||
         max_jerk_x > 4 || max_jerk_y > 4 ||
         fabsf(composer.x.vel) > 0.25f ||

@@ -1,0 +1,15 @@
+# libfacedetection
+
+Source: https://github.com/ShiqiYu/libfacedetection
+
+Imported commit: 3023e1289e3b85311632bcfd45c9895b4292778b
+
+License: 3-clause BSD, see `LICENSE`.
+
+Scope:
+
+- Only the minimum `src/facedetectcnn*` implementation is imported.
+- The full upstream repository, examples, Rust crate, mobile samples and
+  Highway backend are intentionally not vendored.
+- This project uses the original C++ CNN path as a board-test candidate for
+  YuNet/libfacedetection face detection.

@@ -13,13 +13,12 @@ extern "C" {
 #include <vector>
 
 #define PIPELINE_FRAMES 330
-#define PIPELINE_LATENCY_FRAMES 2
+#define DETECTION_RING 8
 
 extern "C" {
 app_state_t g_state;
-uint8_t *g_frame_pool[FRAME_BUF_CNT];
+uint8_t *g_frame_pool[CAPTURE_BUF_CNT];
 uint8_t *g_cached_pool[FRAME_BUF_CNT];
-volatile sig_atomic_t g_app_signal_exit_requested;
 }
 
 static int hal_x;
@@ -41,7 +40,7 @@ extern "C" int ov5640_set_scaler_enabled(int enabled)
 
 struct DelayedDetections {
     frame_view_t view;
-    detection_t detections[DETECTOR_MAX_DETECTIONS];
+    detection_t detections[DETECTOR_MAX_DET];
     int count;
 };
 
@@ -180,16 +179,42 @@ static int control_anchor_inside_core(float x, float y, float height,
            anchor_y <= view.roi_h - TRACK_VIEW_CORE_MARGIN_Y_PX;
 }
 
-int main()
+/* One replay: the same trajectory, with a detection reaching the control tick latency(frame)
+ * frames after its own frame.  The control tick always runs on the capture-time axis, so the
+ * cases differ only in which detection each tick sees. */
+struct ReplayCase {
+    const char *name;
+    int (*latency)(int frame);
+    /* With a steady latency every tick sees one detection, so each tracker state is visible at a
+     * tick end.  When a late detection and the next one meet in one tick, the two confirmations
+     * of RECOVERING can both fall inside that tick. */
+    int steady;
+};
+
+struct ReplayResult {
+    int issued_x[PIPELINE_FRAMES];
+    int issued_y[PIPELINE_FRAMES];
+    double rms_error_px;
+    double max_error_px;
+    double mean_latency_frames;
+};
+
+static int run_replay(const ReplayCase &replay, ReplayResult *result)
 {
     FaceTemporalTracker temporal;
     tracker_t tracker;
     frame_view_t full = make_view(0.0f, 0.0f,
                                   SUBSAMPLED_1X_W, SUBSAMPLED_1X_H,
                                   1, 1, 10.0);
-    DelayedDetections delayed[PIPELINE_LATENCY_FRAMES + 1] = {};
-    int issued_x[PIPELINE_FRAMES] = {};
-    int issued_y[PIPELINE_FRAMES] = {};
+    static DelayedDetections delayed[DETECTION_RING];
+    int *issued_x = result->issued_x;
+    int *issued_y = result->issued_y;
+    int consumed = -1;
+    int detections_used = 0;
+    int latency_sum = 0;
+    double error_sum = 0.0;
+    double error_max = 0.0;
+    int error_count = 0;
     int initial_id = -1;
     int previous_x;
     int previous_y;
@@ -210,6 +235,11 @@ int main()
     int anchor_outside_core = 0;
     int source_before_distractor = -1;
 
+    std::memset(result, 0, sizeof(*result));
+    std::memset(delayed, 0, sizeof(delayed));
+    hal_x = 0;
+    hal_y = 0;
+    hal_scaler_enabled = 1;
     std::memset(&g_state, 0, sizeof(g_state));
     pthread_mutex_init(&g_state.det_mutex, NULL);
     pthread_mutex_init(&g_state.pred_mutex, NULL);
@@ -252,8 +282,7 @@ int main()
         frame_view_t view = make_view(view_x, view_y, IMG_W, IMG_H, 0,
                                       (unsigned int)(frame + 10),
                                       capture_time);
-        DelayedDetections &slot =
-            delayed[frame % (PIPELINE_LATENCY_FRAMES + 1)];
+        DelayedDetections &slot = delayed[frame % DETECTION_RING];
         std::vector<FaceTemporalBox> boxes;
         float truth_x;
         float truth_y;
@@ -291,24 +320,44 @@ int main()
                                              0.65f, view));
         }
         temporal.update(boxes, view, 0.80f, 0.15f, 3, 2);
-        for (size_t i = 0;
-             i < boxes.size() && i < DETECTOR_MAX_DETECTIONS; i++) {
+        for (size_t i = 0; i < boxes.size() && i < DETECTOR_MAX_DET; i++) {
             box_to_detection(boxes[i], &slot.detections[slot.count]);
             slot.count++;
         }
 
-        if (frame >= PIPELINE_LATENCY_FRAMES) {
-            DelayedDetections &ready = delayed[
-                (frame - PIPELINE_LATENCY_FRAMES) %
-                (PIPELINE_LATENCY_FRAMES + 1)];
+        /* The detector publishes in frame order and the control thread takes
+         * each detection as it appears, so a late one is not lost to the next. */
+        for (int source = consumed + 1;
+             source <= frame && source + replay.latency(source) <= frame;
+             source++) {
+            DelayedDetections &ready = delayed[source % DETECTION_RING];
+
             tracker_update_detections(&tracker,
                                       ready.detections, ready.count,
                                       &ready.view, capture_time);
+            consumed = source;
+            detections_used++;
+            latency_sum += frame - source;
         }
         tracker_reset_frame_flag();
         tracker_predict(&tracker, capture_time);
         issued_x[frame] = hal_x;
         issued_y[frame] = hal_y;
+
+        /* Composition error of the frame just captured, outside the engage
+         * transient and the detector outage with its recovery. */
+        if (frame >= 30 && (frame < 185 || frame > 260)) {
+            double error_x = (double)(truth_x - view.roi_x) -
+                (1.0 - TRACK_VIEW_ANCHOR_X_RATIO) * IMG_W;
+            double error_y = (double)(truth_y - view.roi_y) +
+                (TRACK_FACE_ANCHOR_Y_RATIO - 0.5) * truth_h -
+                (1.0 - TRACK_VIEW_ANCHOR_Y_RATIO) * IMG_H;
+            double error = std::sqrt(error_x * error_x + error_y * error_y);
+
+            error_sum += error * error;
+            error_max = std::max(error_max, error);
+            error_count++;
+        }
 
         if (!tracker_is_active(&tracker) || tracker.target_id != initial_id ||
             tracker.source_id < 0) {
@@ -355,25 +404,120 @@ int main()
         }
     }
 
-    std::printf("tracker_pipeline_replay: step=(%d,%d) delta=(%d,%d) "
-                "jerk=(%d,%d) states=%d/%d/%d/%d source=%d "
-                "anchor_outside=%d\n",
-                max_step_x, max_step_y, max_delta_x, max_delta_y,
-                max_jerk_x, max_jerk_y,
-                saw_coast, saw_hold, saw_lost, saw_recover,
-                tracker.source_id, anchor_outside_core);
-    if (max_step_x > 15 || max_step_y > 10 ||
-        max_delta_x > 3 || max_delta_y > 3 ||
-        max_jerk_x > 4 || max_jerk_y > 4 ||
-        !saw_coast || !saw_hold || !saw_lost || !saw_recover ||
-        tracker.source_id == initial_id || anchor_outside_core != 0) {
-        std::fprintf(stderr, "tracker pipeline replay acceptance failed\n");
-        return 1;
+    result->rms_error_px = std::sqrt(error_sum / error_count);
+    result->max_error_px = error_max;
+    result->mean_latency_frames = (double)latency_sum / detections_used;
+    {
+        const int accepted =
+            max_step_x <= (int)ceilf(TRACK_VIEW_MAX_STEP_X_PX) &&
+            max_step_y <= (int)ceilf(TRACK_VIEW_MAX_STEP_Y_PX) &&
+            max_delta_x <= 3 && max_delta_y <= 3 &&
+            max_jerk_x <= 4 && max_jerk_y <= 4 &&
+            saw_coast && saw_hold && saw_lost &&
+            (saw_recover || !replay.steady) &&
+            tracker.source_id != initial_id && anchor_outside_core == 0;
+
+        if (replay.steady || !accepted)
+            std::printf("tracker_pipeline_replay[%s]: step=(%d,%d) delta=(%d,%d) "
+                        "jerk=(%d,%d) states=%d/%d/%d/%d source=%d "
+                        "anchor_outside=%d latency=%.2f rms=%.2fpx max=%.2fpx\n",
+                        replay.name,
+                        max_step_x, max_step_y, max_delta_x, max_delta_y,
+                        max_jerk_x, max_jerk_y,
+                        saw_coast, saw_hold, saw_lost, saw_recover,
+                        tracker.source_id, anchor_outside_core,
+                        result->mean_latency_frames, result->rms_error_px,
+                        result->max_error_px);
+        if (!accepted) {
+            std::fprintf(stderr, "tracker pipeline replay acceptance failed\n");
+            return 1;
+        }
     }
 
     tracker_stop(&tracker);
     pthread_mutex_destroy(&g_state.pred_mutex);
     pthread_mutex_destroy(&g_state.det_mutex);
+    return 0;
+}
+
+static int latency_two_frames(int) { return 2; }
+static int latency_one_frame(int) { return 1; }
+static int latency_on_time(int) { return 0; }
+
+static int g_late_base;
+static int g_late_seed;
+
+/* One detection in ten misses the deadline.  Hashed, not periodic: a period can lock onto the
+ * eight-sample observation noise above and say more about that than about the cadence. */
+static int latency_some_late(int frame)
+{
+    unsigned int hash = ((unsigned int)frame + (unsigned int)g_late_seed * 1000u) * 2654435761u;
+
+    hash ^= hash >> 13;
+    hash *= 2654435761u;
+    hash ^= hash >> 16;
+    return g_late_base + (hash % 10u == 0u ? 1 : 0);
+}
+
+static int mean_rms_with_late_detections(int base, double *mean_rms)
+{
+    static ReplayResult result;
+    const ReplayCase late_case = {"some-late", latency_some_late, 0};
+    const int seeds = 16;
+    double sum = 0.0;
+
+    g_late_base = base;
+    for (g_late_seed = 1; g_late_seed <= seeds; g_late_seed++) {
+        if (run_replay(late_case, &result) != 0)
+            return -1;
+        sum += result.rms_error_px;
+    }
+    *mean_rms = sum / seeds;
+    return 0;
+}
+
+int main()
+{
+    static ReplayResult two_frames;
+    static ReplayResult baseline;
+    static ReplayResult on_time;
+    static ReplayResult repeat;
+    const ReplayCase two_frames_case = {"two-frames", latency_two_frames, 1};
+    const ReplayCase baseline_case = {"baseline", latency_one_frame, 1};
+    const ReplayCase on_time_case = {"on-time", latency_on_time, 1};
+    double late_rms = 0.0;
+    double baseline_late_rms = 0.0;
+
+    if (run_replay(two_frames_case, &two_frames) != 0 ||
+        run_replay(baseline_case, &baseline) != 0 ||
+        run_replay(on_time_case, &on_time) != 0 ||
+        run_replay(on_time_case, &repeat) != 0 ||
+        mean_rms_with_late_detections(0, &late_rms) != 0 ||
+        mean_rms_with_late_detections(1, &baseline_late_rms) != 0)
+        return 1;
+
+    /* Replays must be independent, or the comparison below means nothing. */
+    if (std::memcmp(on_time.issued_x, repeat.issued_x, sizeof(on_time.issued_x)) != 0 ||
+        std::memcmp(on_time.issued_y, repeat.issued_y, sizeof(on_time.issued_y)) != 0) {
+        std::fprintf(stderr, "replay is not repeatable\n");
+        return 1;
+    }
+
+    /* Control tick: a fresher detection must not cost composition accuracy, and detections that miss the
+     * deadline must leave the cadence better than the baseline, at the same miss rate and also
+     * against a baseline with no misses at all. */
+    std::printf("tracker_pipeline_replay: rms on-time=%.2f baseline=%.2f "
+                "one-in-ten-late=%.2f baseline-one-in-ten-late=%.2f\n",
+                on_time.rms_error_px, baseline.rms_error_px,
+                late_rms, baseline_late_rms);
+    if (on_time.rms_error_px >= baseline.rms_error_px ||
+        baseline.rms_error_px >= two_frames.rms_error_px ||
+        late_rms >= baseline.rms_error_px ||
+        late_rms >= baseline_late_rms) {
+        std::fprintf(stderr, "tick cadence lost composition accuracy\n");
+        return 1;
+    }
+
     std::puts("tracker_pipeline_replay_test: OK");
     return 0;
 }

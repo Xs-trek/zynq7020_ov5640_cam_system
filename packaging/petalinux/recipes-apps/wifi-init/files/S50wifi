@@ -14,7 +14,11 @@ WIFI_CONFIG_SOURCE=""
 BOOT_MOUNTED=0
 BOOT_CONFIG_DIRS=""
 
-CONFIG_FILES="${WIFI_CONFIG:-/etc/wifi-init.conf /etc/wifi.conf}"
+# Credentials are no part of the image: they come from the SD boot partition or a file named here.
+CONFIG_FILES="${WIFI_CONFIG:-}"
+
+# The generated configuration holds the key.
+umask 077
 
 log()
 {
@@ -170,7 +174,7 @@ write_wpa_from_passphrase()
         echo "ctrl_interface=${WPA_RUN_DIR}"
         echo "country=${WIFI_COUNTRY}"
         echo "update_config=0"
-        wpa_passphrase "$ssid" "$passphrase" | grep -v '^[[:space:]]*#psk='
+        printf '%s\n' "$passphrase" | wpa_passphrase "$ssid" | grep -v '^[[:space:]]*#psk='
     } > "$tmp_conf" || {
         rm -f "$tmp_conf"
         return 1
@@ -203,7 +207,8 @@ write_wpa_from_psk()
     mv "$tmp_conf" "$WPA_CONF"
 }
 
-read_kv_config()
+# Reads SSID with PSK or PASSPHRASE from a KEY=VALUE file, which may come from a Windows editor.
+parse_kv_config()
 {
     config_file="$1"
     [ -r "$config_file" ] || return 1
@@ -212,9 +217,11 @@ read_kv_config()
     passphrase=""
     psk=""
     cr="$(printf '\r')"
+    bom="$(printf '\357\273\277')"
 
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%"$cr"}"
+        line="${line#"$bom"}"
         case "$line" in
             ''|\#*)
                 ;;
@@ -238,13 +245,20 @@ read_kv_config()
         return 1
     fi
 
-    if valid_psk "$psk"; then
-        write_wpa_from_psk "$ssid" "$psk" || return 1
-    elif valid_passphrase "$passphrase"; then
-        write_wpa_from_passphrase "$ssid" "$passphrase" || return 1
-    else
+    valid_psk "$psk" || valid_passphrase "$passphrase" || {
         warn "ignoring config without valid PSK/passphrase: $config_file"
         return 1
+    }
+}
+
+read_kv_config()
+{
+    parse_kv_config "$1" || return 1
+
+    if valid_psk "$psk"; then
+        write_wpa_from_psk "$ssid" "$psk" || return 1
+    else
+        write_wpa_from_passphrase "$ssid" "$passphrase" || return 1
     fi
 
     WIFI_CONFIG_SOURCE="$config_file"
@@ -264,7 +278,7 @@ load_wifi_config()
     done
 
     for config_dir in $BOOT_CONFIG_DIRS; do
-        for config_name in wifi-init.conf wifi.conf; do
+        for config_name in wifi.txt wifi-init.conf wifi.conf; do
             if read_kv_config "$config_dir/$config_name"; then
                 cleanup_boot_mount
                 return 0
@@ -335,6 +349,13 @@ connect_wifi()
     wait_for_wpa
 }
 
+dhcp_when_associated()
+{
+    wait_for_wpa || true
+    [ -S "$WPA_RUN_DIR/$IFACE" ] || return 0
+    exec udhcpc -i "$IFACE"
+}
+
 start_wifi()
 {
     log "starting"
@@ -354,10 +375,22 @@ start_wifi()
         prompt_wifi_config || return 1
     fi
 
+    if [ "$WIFI_INTERACTIVE" != "1" ]; then
+        # Nothing at boot needs the network, so boot does not wait for it. wpa_supplicant and udhcpc
+        # keep trying: after a power cut the router may come up later.
+        start_supplicant || {
+            cleanup_runtime
+            return 1
+        }
+        cleanup_runtime
+        dhcp_when_associated &
+        return 0
+    fi
+
     if ! connect_wifi; then
         killall wpa_supplicant 2>/dev/null || true
         cleanup_runtime
-        if [ "$WIFI_INTERACTIVE" = "1" ] && [ "$WIFI_CONFIG_SOURCE" != "prompt" ]; then
+        if [ "$WIFI_CONFIG_SOURCE" != "prompt" ]; then
             warn "configured network failed, falling back to serial prompt"
             prompt_wifi_config || return 1
             connect_wifi || {
@@ -413,8 +446,12 @@ case "$1" in
     status)
         status_wifi
         ;;
+    check)
+        parse_kv_config "$2" || exit 1
+        log "config is valid"
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status}"
+        echo "Usage: $0 {start|stop|restart|status|check <file>}"
         exit 1
         ;;
 esac

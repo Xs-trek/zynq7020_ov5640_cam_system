@@ -1,0 +1,2 @@
+# /dev/face_accel for the camsys user; video4linux nodes already belong to the video group.
+SUBSYSTEM=="misc", KERNEL=="face_accel", GROUP="video", MODE="0660"

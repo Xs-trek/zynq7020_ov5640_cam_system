@@ -16,7 +16,7 @@ DRIVER = (
 )
 REGS = ROOT / "third_party/face_accel_ref/face_accel_regs.h"
 UAPI = ROOT / "include/cam_system/face_accel_uapi.h"
-DETECTOR = ROOT / "src/vision/detector.cpp"
+DETECTOR = ROOT / "src/detect/backend_face_accel.cpp"
 EXPECTED = "93ae933897bb510a2a47a34a7ee27249a66904cc09964a1938187891239cbfab"
 
 
@@ -59,14 +59,16 @@ def main() -> None:
     )
     for marker in required_regs:
         if marker not in regs:
-            raise SystemExit(f"missing accelerator register contract: {marker}")
+            raise SystemExit(f"missing register contract: {marker}")
     if "#define CAM_FACE_ACCEL_IP_ID              0xFACE0004u" not in uapi:
-        raise SystemExit("accelerator IP ID missing from UAPI")
+        raise SystemExit("IP ID missing from UAPI")
     for field in ("debug_dma", "debug_transport", "debug_dma_read", "debug_dma_write"):
-        if f"run->{field} = cam_fa_read" not in source:
+        if f"res->{field} = cam_fa_read" not in source:
             raise SystemExit(f"driver does not snapshot {field} before reset")
-    if "face accelerator warmup failed; disabling backend" not in detector:
-        raise SystemExit("warmup failure does not disable the face accelerator backend")
+    # A device that fails its warm-up jobs is closed and never used for detection; the detector
+    # thread reopens it under the recovery policy (src/detect/detector_recovery.h).
+    if "face accelerator warmup failed: %s; closing the device" not in detector:
+        raise SystemExit("warmup failure does not close the face accelerator device")
     print(f"face_accel_contract: OK weight_sha256={digest}")
 
 

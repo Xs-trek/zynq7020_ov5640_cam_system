@@ -51,9 +51,9 @@ typedef struct {
 
 typedef struct {
     int cam_enabled;
-    /* Serialized as yolo_enabled for frontend protocol compatibility. */
     int detector_enabled;
     int quit;
+    int exit_code;      /* what the process exits with; set through app_state_fail */
 
     int tracking_active;
     int tracking_target_id;
@@ -73,11 +73,23 @@ typedef struct {
     unsigned int frame_wake_seq;
     unsigned long frame_publish_drops;
 
+    /* Direct channel: the newest capture buffer, for a reader that needs no cached copy. */
+    int direct_enabled;
+    int direct_latest;              /* capture buffer index, or -1 */
+    frame_view_t direct_view;
+    double direct_publish_time_sec;
+    unsigned int direct_refcount[CAPTURE_BUF_CNT];
+    int direct_held[CAPTURE_BUF_CNT];   /* not to be requeued until reclaimed */
+
     /* 预测框互斥锁 */
     pthread_mutex_t pred_mutex;
 
     /* 跟踪预测框 (tracker 每帧更新 @30fps) */
     predict_box_t pred_box;
+
+    pthread_cond_t det_cond;    /* CLOCK_MONOTONIC; signalled under det_mutex on every publish */
+
+    double start_time_sec;      /* CLOCK_MONOTONIC; set once before the threads start */
 
     pthread_mutex_t jpeg_mutex;
     uint8_t  *jpeg_buf;
@@ -85,7 +97,7 @@ typedef struct {
     unsigned int jpeg_seq;
 
     pthread_mutex_t det_mutex;
-    detection_t detections[DETECTOR_MAX_DETECTIONS];
+    detection_t detections[DETECTOR_MAX_DET];
     int det_count;
     unsigned int det_seq;
     unsigned int det_frame_seq;
@@ -102,7 +114,7 @@ typedef struct {
     int cmd_count;
 
     pthread_mutex_t settings_mutex;
-    int enabled_classes[YOLO_NUM_CLASSES];
+    int enabled_classes[DETECTOR_MAX_CLASSES];
     int enabled_class_count;
     int max_det;
 
@@ -133,14 +145,23 @@ static inline unsigned int app_state_inc_u32(unsigned int *p)
     return __atomic_add_fetch(p, 1U, __ATOMIC_RELEASE);
 }
 
+/* Shuts the process down for a fault: it exits non-zero, so its supervisor restarts it.  The
+ * first fault decides the status. */
+static inline void app_state_fail(app_state_t *s, int exit_code)
+{
+    int none = 0;
+
+    __atomic_compare_exchange_n(&s->exit_code, &none, exit_code, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    app_state_store_int(&s->quit, 1);
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 extern app_state_t g_state;
-extern uint8_t *g_frame_pool[FRAME_BUF_CNT];
+extern uint8_t *g_frame_pool[CAPTURE_BUF_CNT];
 extern uint8_t *g_cached_pool[FRAME_BUF_CNT];
-extern volatile sig_atomic_t g_app_signal_exit_requested;
 
 void app_state_init(app_state_t *s);
 

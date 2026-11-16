@@ -1,10 +1,14 @@
+#include "launcher_policy.h"
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
 #include <linux/input.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -13,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,6 +25,10 @@
 #define DEFAULT_KEY_CODE 148
 #define DEFAULT_CAM_BINARY "/usr/bin/cam_system"
 #define DEFAULT_CAM_LOG "/tmp/cam_system.log"
+#define DEFAULT_CAM_USER "camsys"
+#define CAM_LOG_ROTATE_BYTES (1024 * 1024)
+#define POLL_INTERVAL_MS 2000
+#define STOP_POLL_MS 50
 #define MAX_INPUT_DEVICES 32
 #define INPUT_NAME_LEN 128
 #define BIT_WORD_BITS ((unsigned int)(sizeof(unsigned long) * CHAR_BIT))
@@ -31,12 +40,29 @@ struct watched_input {
 };
 
 static volatile sig_atomic_t g_stop = 0;
-static pid_t g_last_started_pid = -1;
+static pid_t g_child = -1;
+static double g_child_started_at;
+static double g_restart_at;     /* 0 when no restart is pending */
+static launcher_policy_t g_policy;
 
 static void on_signal(int signo)
 {
     (void)signo;
     g_stop = 1;
+}
+
+/* Only interrupts poll; supervise() reaps the child. */
+static void on_child(int signo)
+{
+    (void)signo;
+}
+
+static double monotonic_sec(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 static void log_msg(const char *fmt, ...)
@@ -77,6 +103,13 @@ static long env_long(const char *name, long fallback, long min_value, long max_v
     }
 
     return parsed;
+}
+
+/* CAM_LAUNCHER_AUTOSTART=1 starts cam_system once at launcher start, as a key press would.  Any
+ * other value leaves it to the key. */
+static int autostart_requested(void)
+{
+    return env_long("CAM_LAUNCHER_AUTOSTART", 0, 0, 1) == 1;
 }
 
 static int bit_is_set(unsigned int bit, const unsigned long *bits, size_t words)
@@ -173,21 +206,18 @@ static int cam_system_running(void)
     return 0;
 }
 
-static int last_started_process_running(void)
+/* The log lives in RAM.  A start is the one moment it can be cut without a rotation daemon, and a
+ * crash loop is what would make it grow. */
+static void rotate_log(const char *log_path)
 {
-    if (g_last_started_pid <= 0) {
-        return 0;
-    }
+    struct stat st;
+    char old_path[PATH_MAX];
+    int n = snprintf(old_path, sizeof(old_path), "%s.old", log_path);
 
-    if (kill(g_last_started_pid, 0) == 0) {
-        return 1;
+    if (n > 0 && (size_t)n < sizeof(old_path) && lstat(log_path, &st) == 0 &&
+        S_ISREG(st.st_mode) && st.st_size >= CAM_LOG_ROTATE_BYTES) {
+        (void)rename(log_path, old_path);
     }
-
-    if (errno == ESRCH) {
-        g_last_started_pid = -1;
-    }
-
-    return 0;
 }
 
 static int redirect_child_stdio(const char *log_path)
@@ -203,7 +233,10 @@ static int redirect_child_stdio(const char *log_path)
     }
     close(null_fd);
 
-    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    rotate_log(log_path);
+
+    /* Still root here, and the default path is in a world-writable directory. */
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (log_fd < 0) {
         return -1;
     }
@@ -218,9 +251,25 @@ static int redirect_child_stdio(const char *log_path)
     return 0;
 }
 
-static int launch_cam_system(const char *binary, const char *log_path)
+/* Child, before exec.  Returns -1 if the process would keep privileges it should not have. */
+static int drop_privileges(const struct passwd *user)
 {
-    if (cam_system_running() || last_started_process_running()) {
+    if (user == NULL) {
+        return 0;
+    }
+
+    if (initgroups(user->pw_name, user->pw_gid) < 0 ||
+        setgid(user->pw_gid) < 0 ||
+        setuid(user->pw_uid) < 0) {
+        return -1;
+    }
+
+    return setuid(0) == 0 ? -1 : 0;
+}
+
+static int launch_cam_system(const char *binary, const char *log_path, const char *user_name)
+{
+    if (g_child > 0 || cam_system_running()) {
         log_msg("cam_system already running; key press ignored");
         return 0;
     }
@@ -229,6 +278,16 @@ static int launch_cam_system(const char *binary, const char *log_path)
         log_msg("cam_system binary is not executable: %s: %s",
                 binary, strerror(errno));
         return -1;
+    }
+
+    /* The application needs no privileges.  Started as root, it must not keep them. */
+    const struct passwd *user = NULL;
+    if (geteuid() == 0) {
+        user = getpwnam(user_name);
+        if (user == NULL) {
+            log_msg("user %s does not exist; refusing to run cam_system as root", user_name);
+            return -1;
+        }
     }
 
     pid_t pid = fork();
@@ -246,13 +305,98 @@ static int launch_cam_system(const char *binary, const char *log_path)
             _exit(126);
         }
 
+        if (drop_privileges(user) < 0) {
+            _exit(126);
+        }
+
         execl(binary, binary, (char *)NULL);
         _exit(127);
     }
 
-    g_last_started_pid = pid;
+    g_child = pid;
+    g_child_started_at = monotonic_sec();
+    g_restart_at = 0.0;
     log_msg("started cam_system pid=%ld", (long)pid);
     return 0;
+}
+
+/* Reaps the child, decides about a restart and carries out one that is due. */
+static void supervise(const char *binary, const char *log_path, const char *user_name)
+{
+    if (g_child > 0) {
+        int status;
+        pid_t pid = waitpid(g_child, &status, WNOHANG);
+
+        if (pid == g_child) {
+            const int exited = WIFEXITED(status);
+            const int code = exited ? WEXITSTATUS(status) : 0;
+            const double now = monotonic_sec();
+            const double delay = launcher_restart_delay(&g_policy, exited, code,
+                                                        now - g_child_started_at);
+
+            g_child = -1;
+            if (exited) {
+                log_msg("cam_system exited with status %d", code);
+            } else {
+                log_msg("cam_system killed by signal %d", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+            }
+            if (delay >= 0.0) {
+                g_restart_at = now + delay;
+                log_msg("restarting cam_system in %.1f s", delay);
+            }
+        }
+    }
+
+    if (g_restart_at > 0.0 && monotonic_sec() >= g_restart_at) {
+        g_restart_at = 0.0;
+        (void)launch_cam_system(binary, log_path, user_name);
+    }
+}
+
+/* SIGTERM, then SIGKILL if the process has not stopped in time. */
+static void stop_child(void)
+{
+    if (g_child <= 0) {
+        return;
+    }
+
+    const double deadline = monotonic_sec() + LAUNCHER_STOP_TIMEOUT_SEC;
+    int killed = 0;
+
+    log_msg("stopping cam_system pid=%ld", (long)g_child);
+    (void)kill(g_child, SIGTERM);
+    for (;;) {
+        int status;
+        pid_t pid = waitpid(g_child, &status, WNOHANG);
+
+        if (pid == g_child || (pid < 0 && errno != EINTR)) {
+            break;
+        }
+        if (!killed && monotonic_sec() >= deadline) {
+            log_msg("cam_system did not stop in %.0f s; killing it", LAUNCHER_STOP_TIMEOUT_SEC);
+            (void)kill(g_child, SIGKILL);
+            killed = 1;
+        }
+        (void)poll(NULL, 0, STOP_POLL_MS);
+    }
+    g_child = -1;
+    g_restart_at = 0.0;
+}
+
+/* Poll until the next pending restart, at most POLL_INTERVAL_MS. */
+static int poll_timeout_ms(void)
+{
+    if (g_restart_at > 0.0) {
+        double left_ms = (g_restart_at - monotonic_sec()) * 1000.0;
+
+        if (left_ms < 0.0) {
+            return 0;
+        }
+        if (left_ms < POLL_INTERVAL_MS) {
+            return (int)left_ms + 1;
+        }
+    }
+    return POLL_INTERVAL_MS;
 }
 
 static int scan_inputs(struct watched_input *inputs,
@@ -316,7 +460,8 @@ static void close_inputs(struct watched_input *inputs, int count)
 static void handle_input_event(const struct input_event *event,
                                unsigned int key_code,
                                const char *binary,
-                               const char *log_path)
+                               const char *log_path,
+                               const char *user_name)
 {
     if (event->type != EV_KEY || event->code != key_code) {
         return;
@@ -324,14 +469,15 @@ static void handle_input_event(const struct input_event *event,
 
     if (event->value == 1) {
         log_msg("key code %u pressed", key_code);
-        (void)launch_cam_system(binary, log_path);
+        (void)launch_cam_system(binary, log_path, user_name);
     }
 }
 
 static void watch_inputs(const char *name_filter,
                          unsigned int key_code,
                          const char *binary,
-                         const char *log_path)
+                         const char *log_path,
+                         const char *user_name)
 {
     while (!g_stop) {
         struct watched_input inputs[MAX_INPUT_DEVICES];
@@ -344,6 +490,7 @@ static void watch_inputs(const char *name_filter,
             log_msg("no input device found for name='%s' key=%u; rescanning",
                     name_filter, key_code);
             sleep(2);
+            supervise(binary, log_path, user_name);
             continue;
         }
 
@@ -360,7 +507,9 @@ static void watch_inputs(const char *name_filter,
         }
 
         while (!g_stop) {
-            int rc = poll(fds, (nfds_t)count, 2000);
+            supervise(binary, log_path, user_name);
+
+            int rc = poll(fds, (nfds_t)count, poll_timeout_ms());
             if (rc < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -403,7 +552,7 @@ static void watch_inputs(const char *name_filter,
                         break;
                     }
 
-                    handle_input_event(&event, key_code, binary, log_path);
+                    handle_input_event(&event, key_code, binary, log_path, user_name);
                 }
             }
 
@@ -418,6 +567,9 @@ static void watch_inputs(const char *name_filter,
 
 int main(void)
 {
+    /* The init script may run from a login shell; its hangup must not end the service. */
+    (void)setsid();
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -427,10 +579,12 @@ int main(void)
 
     struct sigaction child_sa;
     memset(&child_sa, 0, sizeof(child_sa));
-    child_sa.sa_handler = SIG_IGN;
-    child_sa.sa_flags = SA_NOCLDWAIT;
+    child_sa.sa_handler = on_child;
+    child_sa.sa_flags = SA_NOCLDSTOP;
     sigemptyset(&child_sa.sa_mask);
     sigaction(SIGCHLD, &child_sa, NULL);
+
+    launcher_policy_init(&g_policy);
 
     const char *name_filter = getenv("CAM_LAUNCHER_EVENT_NAME");
     if (name_filter == NULL) {
@@ -451,9 +605,21 @@ int main(void)
         log_path = DEFAULT_CAM_LOG;
     }
 
-    log_msg("cam-launcher starting: event_name='%s' key=%u binary=%s",
-            name_filter, key_code, binary);
-    watch_inputs(name_filter, key_code, binary, log_path);
+    const char *user_name = getenv("CAM_LAUNCHER_CAM_USER");
+    if (user_name == NULL || *user_name == '\0') {
+        user_name = DEFAULT_CAM_USER;
+    }
+
+    const int autostart = autostart_requested();
+
+    log_msg("cam-launcher starting: event_name='%s' key=%u binary=%s user=%s autostart=%d",
+            name_filter, key_code, binary, user_name, autostart);
+    if (autostart) {
+        log_msg("autostart: starting cam_system without a key press");
+        (void)launch_cam_system(binary, log_path, user_name);
+    }
+    watch_inputs(name_filter, key_code, binary, log_path, user_name);
+    stop_child();
     log_msg("cam-launcher exiting");
 
     return 0;

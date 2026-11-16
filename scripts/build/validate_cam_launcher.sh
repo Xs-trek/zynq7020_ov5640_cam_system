@@ -28,6 +28,9 @@ require_line()
 require_file "${LAUNCHER_DIR}/cam-launcher.bb"
 require_file "${LAUNCHER_DIR}/files/cam-launcher"
 require_file "${LAUNCHER_DIR}/files/cam-launcher.c"
+require_file "${LAUNCHER_DIR}/files/launcher_policy.h"
+require_file "${LAUNCHER_DIR}/files/60-cam-system.rules"
+require_file "${LAUNCHER_DIR}/files/cam-launcher.default"
 require_file "${DT_DIR}/device-tree.bbappend"
 require_file "${DT_DIR}/files/system-user.dtsi"
 require_file "${DT_DIR}/files/pl-custom.dtsi"
@@ -55,6 +58,13 @@ require_line "${LAUNCHER_DIR}/cam-launcher.bb" 'INITSCRIPT_NAME = "cam-launcher"
 require_line "${LAUNCHER_DIR}/cam-launcher.bb" 'RDEPENDS:${PN} += "cam-system"' "cam-system runtime dependency"
 require_line "${LAUNCHER_DIR}/cam-launcher.bb" 'B = "${WORKDIR}/build"' "separate build directory"
 require_line "${LAUNCHER_DIR}/cam-launcher.bb" '${sbindir}/cam-launcher' "sbin install path"
+require_line "${LAUNCHER_DIR}/cam-launcher.bb" 'file://launcher_policy.h' "policy header in SRC_URI"
+require_line "${LAUNCHER_DIR}/cam-launcher.bb" 'USERADD_PARAM:${PN}' "service user"
+require_line "${LAUNCHER_DIR}/cam-launcher.bb" '${sysconfdir}/default/cam-launcher' "launcher defaults file"
+require_line "${LAUNCHER_DIR}/files/cam-launcher.default" 'CAM_LAUNCHER_AUTOSTART=0' "autostart off by default"
+if grep -Eq 'CAM_(DETECTOR|FACE)_' "${LAUNCHER_DIR}/files/cam-launcher"; then
+    fail "the init script must not override /etc/cam_system.conf"
+fi
 
 if grep -Rqs '/sys/class/gpio' "${LAUNCHER_DIR}"; then
     fail "cam-launcher must use input events, not GPIO sysfs"

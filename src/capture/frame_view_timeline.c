@@ -15,8 +15,16 @@ void frame_view_timeline_schedule(frame_view_timeline_t *timeline,
                                   const frame_view_t *view)
 {
     frame_view_timeline_entry_t *entry =
-        &timeline->entries[timeline->next % FRAME_VIEW_TIMELINE_CAPACITY];
+        &timeline->entries[(timeline->next - 1u) % FRAME_VIEW_TIMELINE_CAPACITY];
 
+    /* A slipped command is registered one frame late, under the same sequence as the command
+     * after it.  Both land on the same frame and the later write wins. */
+    if (entry->valid && entry->issued_sequence == issued_sequence) {
+        entry->view = *view;
+        return;
+    }
+
+    entry = &timeline->entries[timeline->next % FRAME_VIEW_TIMELINE_CAPACITY];
     entry->issued_sequence = issued_sequence;
     entry->view = *view;
     entry->valid = 1;

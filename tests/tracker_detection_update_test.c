@@ -7,9 +7,8 @@
 #include <string.h>
 
 app_state_t g_state;
-uint8_t *g_frame_pool[FRAME_BUF_CNT];
+uint8_t *g_frame_pool[CAPTURE_BUF_CNT];
 uint8_t *g_cached_pool[FRAME_BUF_CNT];
-volatile sig_atomic_t g_app_signal_exit_requested;
 
 static int applied_x;
 static int applied_y;
@@ -439,7 +438,7 @@ int main(void)
         tracker_reset_frame_flag();
         tracker_predict(&tracker, receive_time);
     }
-    /* With the fixed 15/10 px path limits, this 0.8 s interval cannot reach
+    /* With the path speed limits, this 0.8 s interval cannot reach
      * the old absolute offsets.  It must still use most of the bounded slew
      * envelope while accepting every observation. */
     if (applied_x - fast_start_x < 180) {
@@ -454,7 +453,8 @@ int main(void)
                 fast_start_y, applied_y);
         return 1;
     }
-    if (maximum_offset_step_x > 15 || maximum_offset_step_y > 10) {
+    if (maximum_offset_step_x > (int)ceilf(TRACK_VIEW_MAX_STEP_X_PX) ||
+        maximum_offset_step_y > (int)ceilf(TRACK_VIEW_MAX_STEP_Y_PX)) {
         fprintf(stderr, "viewport step is not smooth max=(%d,%d)\n",
                 maximum_offset_step_x, maximum_offset_step_y);
         return 1;

@@ -13,6 +13,7 @@ gcc -Wall -Wextra -Werror -std=c11 \
     "${ROOT_DIR}/tests/tracker_detection_update_test.c" \
     "${ROOT_DIR}/src/control/tracker_servo.c" \
     "${ROOT_DIR}/src/control/tracker.c" \
+    "${ROOT_DIR}/src/common/log.c" \
     -lpthread -lm \
     -o "${BIN}"
 

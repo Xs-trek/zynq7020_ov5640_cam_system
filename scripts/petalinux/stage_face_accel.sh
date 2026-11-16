@@ -21,17 +21,18 @@ fi
 
 actual_weight_sha256="$(sha256sum "${WEIGHT_SRC}" | awk '{print $1}')"
 if [[ "${actual_weight_sha256}" != "${EXPECTED_WEIGHT_SHA256}" ]]; then
-    echo "face accelerator weight SHA-256 mismatch: ${actual_weight_sha256}" >&2
+    echo "R9 weight SHA-256 mismatch: ${actual_weight_sha256}" >&2
     exit 1
 fi
 if [[ "$(stat -c %s "${WEIGHT_SRC}")" != "358400" ]]; then
-    echo "face accelerator weight size is not 358400 bytes" >&2
+    echo "R9 weight size is not 358400 bytes" >&2
     exit 1
 fi
 
 install -d "${RECIPE_DST}/files"
-install -m 0644 "${RECIPE_SRC}/cam-face-accel_0.1.1.bb" \
-    "${RECIPE_DST}/cam-face-accel_0.1.1.bb"
+rm -f "${RECIPE_DST}"/cam-face-accel_*.bb
+install -m 0644 "${RECIPE_SRC}/cam-face-accel_0.2.0.bb" \
+    "${RECIPE_DST}/cam-face-accel_0.2.0.bb"
 install -m 0644 "${RECIPE_SRC}/files/Makefile" "${RECIPE_DST}/files/Makefile"
 install -m 0644 "${RECIPE_SRC}/files/cam-face-accel.c" \
     "${RECIPE_DST}/files/cam-face-accel.c"

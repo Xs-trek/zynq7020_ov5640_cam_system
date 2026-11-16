@@ -33,6 +33,11 @@ install -m 0755 \
 install -m 0644 \
     "${ROOT_DIR}/packaging/petalinux/recipes-apps/cam-launcher/files/cam-launcher.c" \
     "${META_USER}/recipes-apps/cam-launcher/files/cam-launcher.c"
+install -m 0644     "${ROOT_DIR}/packaging/petalinux/recipes-apps/cam-launcher/files/launcher_policy.h"     "${META_USER}/recipes-apps/cam-launcher/files/launcher_policy.h"
+install -m 0644     "${ROOT_DIR}/packaging/petalinux/recipes-apps/cam-launcher/files/60-cam-system.rules"     "${META_USER}/recipes-apps/cam-launcher/files/60-cam-system.rules"
+install -m 0644 \
+    "${ROOT_DIR}/packaging/petalinux/recipes-apps/cam-launcher/files/cam-launcher.default" \
+    "${META_USER}/recipes-apps/cam-launcher/files/cam-launcher.default"
 
 image_append="${META_USER}/recipes-core/images/petalinux-image-minimal.bbappend"
 if [[ -f "${image_append}" ]] && ! grep -Eq '(^|[[:space:]])cam-launcher([[:space:]]|")' "${image_append}"; then

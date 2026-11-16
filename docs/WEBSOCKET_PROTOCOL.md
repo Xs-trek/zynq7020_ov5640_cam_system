@@ -29,11 +29,14 @@ WebSocket 不负责启动或停止 `cam_system`，也不改变 REST API 的控�
 
 检测状态消息保持既有 JSON 语义：
 
-- 必含 `status`。
-- 必含 `frame_seq`，表示本条检测快照的源采集帧；可与 MJPEG `X-Frame-Seq` 对齐。
+- 必含 `status`。字段同 `GET /api/status`，其中 `dvp_frames`、`dvp_bad_frames`、`i2c_write_failures` 为负表示还没读到。`dvp_frames`、`dvp_bad_frames` 是本次运行的计数：本进程每一段出流（相机开着的时间）各从起流后的第一次读数（约第 30 帧）算到停流前的最后一次读数，再相加。每次起停流的过渡帧都不计入，所以关开相机之后、稳定运行时 `dvp_bad_frames` 仍为 0。相机关着时这两个值不变。PL 桥自开机的累计值只写日志（`DVP bridge before start-up`、`after stream start`、`at exit`）。
+- 状态还含 `cam_off_reason` 和 `cam_stream_sec`。传感器只在相机开着时出流，每段出流最长 `capture.max_stream_min` 分钟（默认 20，0 为不限）。到时板端自动关相机：`cam_enabled` 变为 false，`cam_off_reason` 为 `"stream_limit"`，直到下一次打开相机；其余时候为 `"none"`。`cam_stream_sec` 是当前这段出流已运行的秒数，相机关着时为 0。旧前端不读这两个字段，按 `cam_enabled` 跟随即可。
+- 必含 `frame_seq`，表示本条检测快照的源采集帧；可与 MJPEG `X-Frame-Seq` 对齐（该头在它描述的 JPEG 之后发送）。
 - 必含 `detections`。
 - tracking 有预测框时可含 `predicted_target`。
 - 关闭 YOLO 后必须发布 `detections: []`，用于前端清框。
+
+这条消息在检测结果或状态变化时发送，此外每秒至少一次，所以新客户端连上后最多 1 s 就能知道板端状态。
 
 ## 4. 客户端接收
 

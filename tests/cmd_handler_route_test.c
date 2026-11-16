@@ -9,9 +9,8 @@
 
 app_state_t g_state;
 tracker_t g_tracker;
-uint8_t *g_frame_pool[FRAME_BUF_CNT];
+uint8_t *g_frame_pool[CAPTURE_BUF_CNT];
 uint8_t *g_cached_pool[FRAME_BUF_CNT];
-volatile sig_atomic_t g_app_signal_exit_requested;
 
 void app_state_init(app_state_t *s)
 {
@@ -21,7 +20,7 @@ void app_state_init(app_state_t *s)
     s->track_target_id = -1;
     s->enabled_class_count = 1;
     s->enabled_classes[0] = 0;
-    s->max_det = DETECTOR_MAX_DETECTIONS;
+    s->max_det = DETECTOR_MAX_DET;
     frame_mailbox_init(s);
     pthread_mutex_init(&s->pred_mutex, NULL);
     pthread_mutex_init(&s->jpeg_mutex, NULL);

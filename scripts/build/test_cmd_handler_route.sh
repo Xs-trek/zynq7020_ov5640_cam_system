@@ -14,6 +14,7 @@ gcc -Wall -Wextra -Werror -std=c11 \
     "${ROOT_DIR}/tests/cmd_handler_route_test.c" \
     "${ROOT_DIR}/src/capture/frame_mailbox.c" \
     "${ROOT_DIR}/src/network/cmd_handler.c" \
+    "${ROOT_DIR}/src/common/log.c" \
     "${ROOT_DIR}/third_party/cjson/cJSON.c" \
     -lpthread \
     -o "${BIN}"

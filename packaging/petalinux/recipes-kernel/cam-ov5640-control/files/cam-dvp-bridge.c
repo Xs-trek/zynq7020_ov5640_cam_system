@@ -6,13 +6,17 @@
  * video, and feeds the Xilinx AXI4-Stream/video DMA path. The driver is kept
  * deliberately small: it models the media graph and fixed pad formats, while
  * the already validated PL datapath remains configured by hardware design.
+ * The bridge's frame counters are the one thing read from the hardware: a frame
+ * of the wrong size is otherwise invisible to software.
  */
 
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <media/media-entity.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-subdev.h>
 #include <linux/v4l2-mediabus.h>
 
@@ -20,9 +24,19 @@
 #define CAM_DVP_BRIDGE_SINK 0
 #define CAM_DVP_BRIDGE_SOURCE 1
 
+/* Snapshots the PL takes at each VSYNC; see ov5640_to_lcd_v1_0_S00_AXI.v. */
+#define CAM_DVP_REG_FRAME_COUNT 0x14
+#define CAM_DVP_REG_SYNC_ERROR_COUNT 0x24
+
+#define CAM_DVP_CID_BASE (V4L2_CID_USER_BASE + 0x2010)
+#define CAM_DVP_CID_FRAMES (CAM_DVP_CID_BASE + 0)
+#define CAM_DVP_CID_BAD_FRAMES (CAM_DVP_CID_BASE + 1)
+
 struct cam_dvp_bridge {
 	struct device *dev;
-	struct mutex lock;
+	void __iomem *regs;
+	struct mutex lock;	/* pad formats and controls */
+	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_subdev sd;
 	struct media_pad pads[CAM_DVP_BRIDGE_PADS];
 	struct v4l2_mbus_framefmt formats[CAM_DVP_BRIDGE_PADS];
@@ -61,6 +75,17 @@ cam_dvp_bridge_get_pad_format(struct cam_dvp_bridge *bridge,
 		return v4l2_subdev_get_try_format(&bridge->sd, state, pad);
 
 	return &bridge->formats[pad];
+}
+
+static int cam_dvp_bridge_init_cfg(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state)
+{
+	struct cam_dvp_bridge *bridge = to_cam_dvp_bridge(sd);
+	unsigned int pad;
+
+	for (pad = 0; pad < CAM_DVP_BRIDGE_PADS; pad++)
+		*v4l2_subdev_get_try_format(sd, state, pad) = bridge->formats[pad];
+	return 0;
 }
 
 static int cam_dvp_bridge_enum_mbus_code(struct v4l2_subdev *sd,
@@ -165,6 +190,7 @@ static const struct v4l2_subdev_video_ops cam_dvp_bridge_video_ops = {
 };
 
 static const struct v4l2_subdev_pad_ops cam_dvp_bridge_pad_ops = {
+	.init_cfg = cam_dvp_bridge_init_cfg,
 	.enum_mbus_code = cam_dvp_bridge_enum_mbus_code,
 	.get_fmt = cam_dvp_bridge_get_fmt,
 	.set_fmt = cam_dvp_bridge_set_fmt,
@@ -179,6 +205,68 @@ static const struct media_entity_operations cam_dvp_bridge_media_ops = {
 	.link_validate = v4l2_subdev_link_validate,
 };
 
+static int cam_dvp_bridge_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct cam_dvp_bridge *bridge =
+		container_of(ctrl->handler, struct cam_dvp_bridge, ctrls);
+
+	switch (ctrl->id) {
+	case CAM_DVP_CID_FRAMES:
+		ctrl->val = ioread32(bridge->regs + CAM_DVP_REG_FRAME_COUNT) & S32_MAX;
+		return 0;
+	case CAM_DVP_CID_BAD_FRAMES:
+		ctrl->val = ioread32(bridge->regs + CAM_DVP_REG_SYNC_ERROR_COUNT) & S32_MAX;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct v4l2_ctrl_ops cam_dvp_bridge_ctrl_ops = {
+	.g_volatile_ctrl = cam_dvp_bridge_g_volatile_ctrl,
+};
+
+static const struct v4l2_ctrl_config cam_dvp_bridge_ctrls[] = {
+	{
+		.ops = &cam_dvp_bridge_ctrl_ops,
+		.id = CAM_DVP_CID_FRAMES,
+		.name = "DVP Frames",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+		.max = S32_MAX,
+		.step = 1,
+	},
+	{
+		.ops = &cam_dvp_bridge_ctrl_ops,
+		.id = CAM_DVP_CID_BAD_FRAMES,
+		.name = "DVP Bad Frames",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+		.max = S32_MAX,
+		.step = 1,
+	},
+};
+
+static int cam_dvp_bridge_init_controls(struct cam_dvp_bridge *bridge)
+{
+	struct v4l2_ctrl_handler *hdl = &bridge->ctrls;
+	unsigned int i;
+	int ret;
+
+	v4l2_ctrl_handler_init(hdl, ARRAY_SIZE(cam_dvp_bridge_ctrls));
+	hdl->lock = &bridge->lock;
+	for (i = 0; i < ARRAY_SIZE(cam_dvp_bridge_ctrls); i++)
+		v4l2_ctrl_new_custom(hdl, &cam_dvp_bridge_ctrls[i], NULL);
+
+	ret = hdl->error;
+	if (ret) {
+		v4l2_ctrl_handler_free(hdl);
+		return ret;
+	}
+	bridge->sd.ctrl_handler = hdl;
+	return 0;
+}
+
 static int cam_dvp_bridge_probe(struct platform_device *pdev)
 {
 	struct cam_dvp_bridge *bridge;
@@ -189,6 +277,9 @@ static int cam_dvp_bridge_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	bridge->dev = &pdev->dev;
+	bridge->regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(bridge->regs))
+		return PTR_ERR(bridge->regs);
 	mutex_init(&bridge->lock);
 	cam_dvp_bridge_set_defaults(bridge);
 
@@ -199,6 +290,10 @@ static int cam_dvp_bridge_probe(struct platform_device *pdev)
 	bridge->sd.entity.function = MEDIA_ENT_F_PROC_VIDEO_PIXEL_ENC_CONV;
 	strscpy(bridge->sd.name, dev_name(&pdev->dev), sizeof(bridge->sd.name));
 
+	ret = cam_dvp_bridge_init_controls(bridge);
+	if (ret)
+		goto destroy_mutex;
+
 	bridge->pads[CAM_DVP_BRIDGE_SINK].flags = MEDIA_PAD_FL_SINK;
 	bridge->pads[CAM_DVP_BRIDGE_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
 	bridge->sd.entity.ops = &cam_dvp_bridge_media_ops;
@@ -206,7 +301,7 @@ static int cam_dvp_bridge_probe(struct platform_device *pdev)
 	ret = media_entity_pads_init(&bridge->sd.entity, CAM_DVP_BRIDGE_PADS,
 				     bridge->pads);
 	if (ret)
-		goto destroy_mutex;
+		goto free_ctrls;
 
 	platform_set_drvdata(pdev, bridge);
 
@@ -219,6 +314,8 @@ static int cam_dvp_bridge_probe(struct platform_device *pdev)
 
 entity_cleanup:
 	media_entity_cleanup(&bridge->sd.entity);
+free_ctrls:
+	v4l2_ctrl_handler_free(&bridge->ctrls);
 destroy_mutex:
 	mutex_destroy(&bridge->lock);
 	return ret;
@@ -230,6 +327,7 @@ static int cam_dvp_bridge_remove(struct platform_device *pdev)
 
 	v4l2_async_unregister_subdev(&bridge->sd);
 	media_entity_cleanup(&bridge->sd.entity);
+	v4l2_ctrl_handler_free(&bridge->ctrls);
 	mutex_destroy(&bridge->lock);
 	return 0;
 }

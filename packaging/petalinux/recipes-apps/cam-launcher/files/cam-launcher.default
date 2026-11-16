@@ -1,0 +1,6 @@
+# /etc/default/cam-launcher - read by /etc/init.d/cam-launcher.
+#
+# CAM_LAUNCHER_AUTOSTART=1 starts cam_system when the launcher starts at boot, as a PS_KEY1 press
+# would; the key keeps working either way.  0 (the default) waits for the key.  The sensor runs
+# whenever cam_system runs, so leave this off where its run time has to be limited.
+CAM_LAUNCHER_AUTOSTART=0

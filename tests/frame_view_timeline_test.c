@@ -75,6 +75,13 @@ int main(void)
     frame_view_timeline_resolve(&timeline, 49u, &full, &resolved);
     require_view(&resolved, 49.0f, 0.0f, 0, "ring newest mismatch");
 
+    /* A slipped command and its successor share a sequence: the later write is the real one. */
+    frame_view_timeline_init(&timeline);
+    frame_view_timeline_schedule(&timeline, 60u, &crop_a);
+    frame_view_timeline_schedule(&timeline, 60u, &crop_b);
+    frame_view_timeline_resolve(&timeline, 62u, &full, &resolved);
+    require_view(&resolved, 140.0f, 110.0f, 0, "same-sequence successor mismatch");
+
     puts("frame_view_timeline_test: OK");
     return 0;
 }

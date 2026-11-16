@@ -17,6 +17,10 @@ gcc -Wall -Wextra -Werror -std=c11 \
     -I"${ROOT_DIR}/src" \
     -c "${ROOT_DIR}/src/control/tracker_servo.c" \
     -o "${BUILD_DIR}/tracker_servo.o"
+gcc -Wall -Wextra -Werror -std=c11 \
+    -I"${ROOT_DIR}/src" \
+    -c "${ROOT_DIR}/src/common/log.c" \
+    -o "${BUILD_DIR}/log.o"
 g++ -Wall -Wextra -Werror -std=c++11 \
     -I"${ROOT_DIR}/include" \
     -I"${ROOT_DIR}/src" \
@@ -24,6 +28,7 @@ g++ -Wall -Wextra -Werror -std=c++11 \
     "${ROOT_DIR}/src/vision/face_temporal_tracker.cpp" \
     "${BUILD_DIR}/tracker.o" \
     "${BUILD_DIR}/tracker_servo.o" \
+    "${BUILD_DIR}/log.o" \
     -lpthread -lm \
     -o "${BIN}"
 

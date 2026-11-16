@@ -5,7 +5,10 @@
 *.so
 *.out
 *.d
-logs/serial_*.log
+logs/
+wifi.txt
+wifi.conf
+wifi-init.conf
 measurements/
 out/
 

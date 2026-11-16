@@ -7,16 +7,28 @@
  *
  * 依赖: cJSON (third_party/)
  */
+#define LOG_TAG "net"
+
 #include "network/net_server.h"
 #include "network/cmd_handler.h"
+#include "network/http_parse.h"
+#include "network/mjpeg_framing.h"
+#include "network/status_json.h"
 #include "network/ws_protocol.h"
 #include "cam_system/app_state.h"
 #include "cam_system/config.h"
+#include "cam_system/version.h"
+#include "capture/capture.h"
+#include "common/fps_meter.h"
+#include "common/log.h"
+#include "common/time_util.h"
+#include "detect/detector.h"
+#include "media/jpeg_worker.h"
 
 #include <stdio.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sysexits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,14 +36,14 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/signalfd.h>
 #include <linux/sockios.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
-/* ── WebSocket 辅助 ── */
 #include <openssl/sha.h>
 
+#ifdef CAM_SYSTEM_ENABLE_CPU_DETECTORS
 /* ── COCO 类名 ── */
 static const char *coco_names_tbl[80] = {
     "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
@@ -46,10 +58,13 @@ static const char *coco_names_tbl[80] = {
     "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
     "toothbrush"
 };
+#endif
 
 static const char *coco_names_lookup(int id) {
     if (id == DETECTION_CLASS_FACE) return "face";
+#ifdef CAM_SYSTEM_ENABLE_CPU_DETECTORS
     if (id >= 0 && id < 80) return coco_names_tbl[id];
+#endif
     return "unknown";
 }
 
@@ -99,6 +114,7 @@ typedef struct {
     uint8_t *mjpeg_buf;        /* 专属于这个客户端的推流缓冲区 */
     size_t mjpeg_buf_cap;      /* 缓冲区最大容量 */
     uint32_t mjpeg_drop_count; /* transport-backpressure dropped frames */
+    double accepted_sec;       /* CLIENT_NEW: a request must arrive in time */
 } client_t;
 
 static int listen_fd = -1;
@@ -109,11 +125,17 @@ static int server_running = 0;
 static int send_all_limited(int fd, const void *buf, size_t len,
                             int wait_budget_ms);
 
-static void set_nonblock(int fd)
+static int set_nonblock(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+    return 0;
 }
+
+static fps_meter_t g_stream_fps;
+static unsigned int g_stream_last_seq;
 
 static void client_remove(int idx)
 {
@@ -165,15 +187,33 @@ static int send_all_limited(int fd, const void *buf, size_t len, int wait_budget
     return 0;
 }
 
+/* A phone that leaves the network sends nothing, not even a FIN.  Keepalive finds it on an idle
+ * connection, the user timeout on one with data in flight. */
+static void configure_client_socket(int fd)
+{
+    static const int enabled = 1;
+    static const int idle_sec = CLIENT_KEEPALIVE_IDLE_SEC;
+    static const int interval_sec = CLIENT_KEEPALIVE_INTERVAL_SEC;
+    static const int probes = CLIENT_KEEPALIVE_PROBES;
+    static const unsigned int user_timeout_ms = CLIENT_TCP_USER_TIMEOUT_MS;
+
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_sec, sizeof(idle_sec)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_sec, sizeof(interval_sec)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) < 0)
+        LOG_W("TCP keepalive setup failed: %s", strerror(errno));
+}
+
 static void configure_mjpeg_socket(int fd)
 {
     int opt = 1;
     int sndbuf = MJPEG_SOCKET_SNDBUF_BYTES;
 
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0)
-        fprintf(stderr, "[net] TCP_NODELAY failed: %s\n", strerror(errno));
+        LOG_W("TCP_NODELAY failed: %s", strerror(errno));
     if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0)
-        fprintf(stderr, "[net] SO_SNDBUF failed: %s\n", strerror(errno));
+        LOG_W("SO_SNDBUF failed: %s", strerror(errno));
 }
 
 static int mjpeg_socket_backlogged(int fd)
@@ -216,21 +256,21 @@ static int send_mjpeg_frame(client_t *c)
     c->last_jpeg_seq = g_state.jpeg_seq;
     pthread_mutex_unlock(&g_state.jpeg_mutex);
 
-    /* 组装 HTTP 头 */
-    char hdr[256];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "\r\n--%s\r\n"
-        "Content-Type: image/jpeg\r\n"
-        "Content-Length: %zu\r\n"
-        "X-Frame-Seq: %u\r\n"
-        "X-Dropped-Frames: %u\r\n\r\n",
-        MJPEG_BOUNDARY, sz, c->last_jpeg_seq, c->mjpeg_drop_count);
-    if (hlen < 0 || hlen >= (int)sizeof(hdr))
+    /* Rate of distinct frames sent, however many clients receive each. */
+    if (c->last_jpeg_seq != g_stream_last_seq) {
+        g_stream_last_seq = c->last_jpeg_seq;
+        fps_meter_tick(&g_stream_fps, monotonic_sec());
+    }
+
+    char tail[MJPEG_PART_TAIL_MAX];
+    int tail_len = mjpeg_format_part_tail(tail, sizeof(tail), c->last_jpeg_seq,
+                                          c->mjpeg_drop_count);
+    if (tail_len < 0)
         return -1;
 
     int ret = 0;
-    if (send_all_limited(c->fd, hdr, hlen, MJPEG_SEND_WAIT_BUDGET_MS) < 0 ||
-        send_all_limited(c->fd, c->mjpeg_buf, sz, MJPEG_SEND_WAIT_BUDGET_MS) < 0) {
+    if (send_all_limited(c->fd, c->mjpeg_buf, sz, MJPEG_SEND_WAIT_BUDGET_MS) < 0 ||
+        send_all_limited(c->fd, tail, tail_len, MJPEG_SEND_WAIT_BUDGET_MS) < 0) {
         ret = -1;
     }
     return ret;
@@ -381,121 +421,61 @@ static int ws_handshake(client_t *c, const char *key)
     return 0;
 }
 
-static int parse_content_length(const char *req, const char *headers_end)
+static void collect_status(status_fields_t *status)
 {
-    const char *p = req;
+    detector_status_t detector;
+    capture_health_t health;
+    const double now = monotonic_sec();
 
-    while (p < headers_end) {
-        const char *line_end = strstr(p, "\r\n");
-        if (!line_end || line_end > headers_end)
-            line_end = headers_end;
+    detector_get_status(&detector);
+    status->cam_enabled = app_state_load_int(&g_state.cam_enabled);
+    status->detector_enabled = app_state_load_int(&g_state.detector_enabled);
+    status->tracking = app_state_load_int(&g_state.tracking_active);
+    status->target_id = app_state_load_int(&g_state.tracking_target_id);
+    status->fps_capture = capture_get_fps(now);
+    status->fps_inference = detector.fps;
+    status->fps_stream = fps_meter_read(&g_stream_fps, now);
+    status->uptime_sec = (unsigned int)(now - g_state.start_time_sec);
+    status->status_seq = app_state_load_u32(&g_state.status_seq);
+    status->detector_health = detector_health_name(detector.health);
+    status->detector_failures = detector.failures;
+    status->detector_last_error = detector.last_error;
+    status->isp_slips = capture_get_isp_slips();
+    status->capture_restarts = capture_get_restarts();
+    capture_get_health(&health);
+    status->dvp_frames = health.dvp_frames;
+    status->dvp_bad_frames = health.dvp_bad_frames;
+    status->i2c_write_failures = health.i2c_write_failures;
+    status->v4l2_error_frames = health.v4l2_error_frames;
+    status->version = CAM_SYSTEM_VERSION;
+    status->git_commit = CAM_SYSTEM_GIT_COMMIT;
+    status->driver_uapi = detector.identity.driver_uapi;
+    status->hw_revision = detector.identity.hw_revision;
+    /* The identity lives in the status snapshot copied above. */
+    static char weights_sha256[sizeof(detector.identity.weight_sha256)];
+    memcpy(weights_sha256, detector.identity.weight_sha256, sizeof(weights_sha256));
+    status->weights_sha256 = weights_sha256;
+    status->detector_input = detector.direct_input ? "direct" : "copy";
+    {
+        unsigned int stream_sec;
+        int stopped_by_limit;
 
-        if ((line_end - p) >= 15 &&
-            strncasecmp(p, "Content-Length:", 15) == 0) {
-            char *endp;
-            long len;
-
-            p += 15;
-            while (p < line_end && (*p == ' ' || *p == '\t'))
-                p++;
-
-            errno = 0;
-            len = strtol(p, &endp, 10);
-            if (errno || endp == p || len < 0 ||
-                len > (long)(sizeof(clients[0].recv_buf) - 1))
-                return -1;
-            return (int)len;
-        }
-
-        if (line_end == headers_end)
-            break;
-        p = line_end + 2;
+        capture_get_stream_state(now, &stream_sec, &stopped_by_limit);
+        status->cam_off_reason = stopped_by_limit ? "stream_limit" : "none";
+        status->cam_stream_sec = stream_sec;
     }
-
-    return 0;
 }
 
-static int http_request_complete(const client_t *c)
+/* An answer the client cannot use, or one with nothing in it.  The connection ends here. */
+static void http_reply_empty(client_t *c, const char *status_line)
 {
-    const char *headers_end = strstr(c->recv_buf, "\r\n\r\n");
-    int header_len;
-    int body_len;
+    char resp[128];
+    int n = snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status_line);
 
-    if (!headers_end)
-        return 0;
-
-    headers_end += 4;
-    if (strncmp(c->recv_buf, "POST ", 5) != 0)
-        return 1;
-
-    body_len = parse_content_length(c->recv_buf, headers_end - 4);
-    if (body_len < 0)
-        return -1;
-
-    header_len = (int)(headers_end - c->recv_buf);
-    return c->recv_len >= header_len + body_len;
-}
-
-static void format_target_id(char *buf, size_t sz)
-{
-    int target_id = app_state_load_int(&g_state.tracking_target_id);
-
-    if (target_id >= 0)
-        snprintf(buf, sz, "%d", target_id);
-    else
-        snprintf(buf, sz, "null");
-}
-
-static int json_append(char *json, size_t sz, int pos, const char *fmt, ...)
-{
-    va_list ap;
-    int n;
-
-    if (pos < 0 || (size_t)pos >= sz)
-        return -1;
-
-    va_start(ap, fmt);
-    n = vsnprintf(json + pos, sz - (size_t)pos, fmt, ap);
-    va_end(ap);
-
-    if (n < 0 || (size_t)n >= sz - (size_t)pos)
-        return -1;
-    return pos + n;
-}
-
-static int append_status_fields(char *json, size_t sz, int pos)
-{
-    char target_id[16];
-    unsigned int status_seq = app_state_load_u32(&g_state.status_seq);
-
-    format_target_id(target_id, sizeof(target_id));
-    return json_append(json, sz, pos,
-        "\"cam_enabled\":%s,"
-        "\"yolo_enabled\":%s,"
-        "\"tracking\":%s,"
-        "\"target_id\":%s,"
-        "\"fps_capture\":0,"
-        "\"fps_inference\":0,"
-        "\"fps_stream\":0,"
-        "\"uptime_sec\":0,"
-        "\"status_seq\":%u",
-        app_state_load_int(&g_state.cam_enabled) ? "true" : "false",
-        app_state_load_int(&g_state.detector_enabled) ? "true" : "false",
-        app_state_load_int(&g_state.tracking_active) ? "true" : "false",
-        target_id,
-        status_seq);
-}
-
-static int make_status_body(char *body, size_t sz)
-{
-    int pos = 0;
-
-    pos = json_append(body, sz, pos, "{\"status\":{");
-    pos = append_status_fields(body, sz, pos);
-    pos = json_append(body, sz, pos, "},");
-    pos = append_status_fields(body, sz, pos);
-    pos = json_append(body, sz, pos, "}");
-    return pos;
+    if (n > 0 && n < (int)sizeof(resp))
+        (void)send_all(c->fd, resp, (size_t)n);
+    c->type = CLIENT_API;
 }
 
 /* ── HTTP 请求解析 ── */
@@ -511,25 +491,24 @@ static void handle_http_request(client_t *c)
             "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
             "Pragma: no-cache\r\n"
             "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n\r\n";
+            "Access-Control-Allow-Origin: *\r\n\r\n"
+            MJPEG_FIRST_PART_HEAD;
         c->mjpeg_buf_cap = FRAME_SIZE;
         c->mjpeg_buf = (uint8_t *)malloc(c->mjpeg_buf_cap);
         if (!c->mjpeg_buf) {
-            const char *oom_resp =
-                "HTTP/1.1 503 Service Unavailable\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n\r\n";
-
-            fprintf(stderr, "[net] mjpeg_buf malloc failed\n");
-            send_all(c->fd, oom_resp, strlen(oom_resp));
-            c->type = CLIENT_API;
+            LOG_E("mjpeg_buf malloc failed");
+            http_reply_empty(c, "503 Service Unavailable");
             return;
         }
 
         configure_mjpeg_socket(c->fd);
         if (send_all(c->fd, resp, strlen(resp)) == 0) {
             c->type = CLIENT_MJPEG;
-            c->last_jpeg_seq = 0;
+            /* Encoding stops without clients, so the buffered JPEG may be old: start with the
+             * next frame encoded after this client connected. */
+            pthread_mutex_lock(&g_state.jpeg_mutex);
+            c->last_jpeg_seq = g_state.jpeg_seq;
+            pthread_mutex_unlock(&g_state.jpeg_mutex);
             c->mjpeg_drop_count = 0;
         } else {
             c->type = CLIENT_API;
@@ -537,53 +516,45 @@ static void handle_http_request(client_t *c)
 
     } else if (strncmp(req, "GET /api/status", 15) == 0) {
         /* 设备状态 — APP 连接测试用 */
-        char body[1024];
-        int body_len = make_status_body(body, sizeof(body));
+        status_fields_t status;
+        char body[STATUS_BODY_MAX];
+        char resp[STATUS_BODY_MAX + 256];
+        int body_len;
+        int resp_len;
 
+        collect_status(&status);
+        body_len = status_json_body(body, sizeof(body), &status);
         if (body_len < 0) {
-            const char *resp =
-                "HTTP/1.1 500 Internal Server Error\r\n"
-                "Content-Length: 0\r\n\r\n";
-            send_all(c->fd, resp, strlen(resp));
-            c->type = CLIENT_API;
+            http_reply_empty(c, "500 Internal Server Error");
             return;
         }
 
-        char resp[1280];
-        snprintf(resp, sizeof(resp),
+        resp_len = snprintf(resp, sizeof(resp),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Content-Length: %zu\r\n\r\n%s",
-            (size_t)body_len, body);
-        send_all(c->fd, resp, strlen(resp));
+            "Connection: close\r\n"
+            "Content-Length: %d\r\n\r\n%s",
+            body_len, body);
+        if (resp_len > 0 && resp_len < (int)sizeof(resp))
+            (void)send_all(c->fd, resp, (size_t)resp_len);
         c->type = CLIENT_API;
 
-    } else if (strncmp(req, "GET /ws", 7) == 0 ||
-               strstr(req, "Upgrade: websocket")) {
+    } else if (strncmp(req, "GET /ws", 7) == 0) {
         /* WebSocket 升级 */
+        const char *headers_end = strstr(req, "\r\n\r\n");
+        size_t key_len = 0;
+        const char *key_value = http_header_value(req, headers_end, "Sec-WebSocket-Key", &key_len);
+        char key[128];
         int upgraded = 0;
-        char *key_start = strstr(req, "Sec-WebSocket-Key: ");
-        if (key_start) {
-            key_start += 19;
-            char *key_end = strstr(key_start, "\r\n");
-            if (key_end) {
-                char key[128];
-                int klen = key_end - key_start;
-                if (klen < (int)sizeof(key)) {
-                    memcpy(key, key_start, klen);
-                    key[klen] = '\0';
-                    upgraded = (ws_handshake(c, key) == 0);
-                }
-            }
+
+        if (key_value && key_len < sizeof(key)) {
+            memcpy(key, key_value, key_len);
+            key[key_len] = '\0';
+            upgraded = ws_handshake(c, key) == 0;
         }
-        if (!upgraded) {
-            const char *resp =
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Length: 0\r\n\r\n";
-            send_all(c->fd, resp, strlen(resp));
-            c->type = CLIENT_API;
-        }
+        if (!upgraded)
+            http_reply_empty(c, "400 Bad Request");
 
     } else if (strncmp(req, "POST /api/", 10) == 0) {
         /* REST API */
@@ -604,22 +575,99 @@ static void handle_http_request(client_t *c)
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Access-Control-Max-Age: 86400\r\n\r\n";
+            "Access-Control-Max-Age: 86400\r\n"
+            "Connection: close\r\n\r\n";
         send_all(c->fd, resp, strlen(resp));
         c->type = CLIENT_API;
 
     } else {
-        const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        send_all(c->fd, resp, strlen(resp));
-        c->type = CLIENT_API;
+        http_reply_empty(c, "404 Not Found");
     }
 }
 
+static void accept_client(double now)
+{
+    int cfd = accept(listen_fd, NULL, NULL);
+
+    if (cfd < 0)
+        return;
+    if (client_count >= MAX_HTTP_CLIENTS + MAX_WS_CLIENTS) {
+        LOG_W_RL(5.0, 3, "connection refused: all %d client slots in use", client_count);
+        close(cfd);
+        return;
+    }
+    if (set_nonblock(cfd) < 0) {
+        LOG_W("O_NONBLOCK failed: %s", strerror(errno));
+        close(cfd);
+        return;
+    }
+    configure_client_socket(cfd);
+
+    client_t *nc = &clients[client_count++];
+
+    memset(nc, 0, sizeof(*nc));
+    nc->fd = cfd;
+    nc->type = CLIENT_NEW;
+    nc->accepted_sec = now;
+}
+
+/* Reads what the client sent and acts on it.  Returns -1 when the connection is finished. */
+static int client_receive(client_t *c)
+{
+    int space = (int)sizeof(c->recv_buf) - c->recv_len - 1;
+    ssize_t n;
+
+    if (space <= 0)
+        return -1;
+
+    n = recv(c->fd, c->recv_buf + c->recv_len, (size_t)space, 0);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR))
+        return -1;
+    if (n < 0)
+        return 0;
+    if (c->type == CLIENT_MJPEG) {
+        c->recv_len = 0;    /* nothing it could say matters */
+        return 0;
+    }
+
+    c->recv_len += (int)n;
+    c->recv_buf[c->recv_len] = '\0';
+
+    if (c->type == CLIENT_NEW) {
+        int complete = http_request_complete(c->recv_buf, c->recv_len,
+                                              (int)sizeof(c->recv_buf) - 1);
+
+        if (complete < 0)
+            return -1;
+        if (complete > 0) {
+            handle_http_request(c);
+            c->recv_len = 0;
+            if (c->type == CLIENT_API)
+                return -1;  /* 请求处理完关闭连接 */
+        }
+    }
+    if (c->type == CLIENT_WS && c->ws_handshake_done)
+        return ws_process_recv_buffer(c);
+    return 0;
+}
+
 /* ── 主事件循环 ── */
-int net_server_run(void)
+/* Returns 1 when a shutdown signal was read from signal_fd. */
+static int read_shutdown_signal(int signal_fd)
+{
+    struct signalfd_siginfo info;
+    ssize_t n = read(signal_fd, &info, sizeof(info));
+
+    if (n != (ssize_t)sizeof(info))
+        return 0;
+    LOG_I("Signal %u (%s) requested shutdown", info.ssi_signo, strsignal((int)info.ssi_signo));
+    return 1;
+}
+
+int net_server_run(int signal_fd)
 {
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("[net] socket"); return -1; }
+    if (listen_fd < 0) { LOG_E("socket: %s", strerror(errno)); return -1; }
 
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -631,129 +679,109 @@ int net_server_run(void)
     };
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("[net] bind"); close(listen_fd); return -1;
+        LOG_E("bind: %s", strerror(errno)); close(listen_fd); return -1;
     }
     if (listen(listen_fd, 8) < 0) {
-        perror("[net] listen"); close(listen_fd); return -1;
+        LOG_E("listen: %s", strerror(errno)); close(listen_fd); return -1;
     }
 
-    set_nonblock(listen_fd);
+    if (set_nonblock(listen_fd) < 0) {
+        LOG_E("O_NONBLOCK: %s", strerror(errno)); close(listen_fd); return -1;
+    }
     app_state_store_int(&server_running, 1);
-    printf("[net] HTTP server listening on port %d\n", HTTP_PORT);
+    LOG_I("HTTP server listening on port %d", HTTP_PORT);
+
+    int stream_demand = 0;
 
     while (app_state_load_int(&server_running) &&
            !app_state_load_int(&g_state.quit)) {
-        if (g_app_signal_exit_requested) {
-            printf("[net] Signal requested shutdown\n");
-            app_state_store_int(&g_state.quit, 1);
-            app_state_store_int(&server_running, 0);
-            break;
-        }
-
         fd_set rd_set;
         FD_ZERO(&rd_set);
         FD_SET(listen_fd, &rd_set);
         int max_fd = listen_fd;
-        int have_mjpeg_client = 0;
+        if (signal_fd >= 0) {
+            FD_SET(signal_fd, &rd_set);
+            if (signal_fd > max_fd) max_fd = signal_fd;
+        }
+        int mjpeg_clients = 0;
 
+        /* An MJPEG client sends nothing after its request, so readable means it has gone.  The
+         * send path cannot tell: a socket that was backlogged when the connection died keeps its
+         * SIOCOUTQ count, and every frame is then dropped without touching the socket. */
         for (int i = 0; i < client_count; i++) {
-            if (clients[i].type != CLIENT_MJPEG) {
-                FD_SET(clients[i].fd, &rd_set);
-            } else {
-                have_mjpeg_client = 1;
-            }
+            FD_SET(clients[i].fd, &rd_set);
+            if (clients[i].type == CLIENT_MJPEG)
+                mjpeg_clients++;
             if (clients[i].fd > max_fd) max_fd = clients[i].fd;
+        }
+        if (mjpeg_clients != stream_demand) {
+            stream_demand = mjpeg_clients;
+            jpeg_worker_set_demand(stream_demand);
+            LOG_I("MJPEG clients: %d", stream_demand);
         }
 
         /* 33 ms 固定等待再叠加 send/copy 开销只能得到约 29.1 fps。
          * 有 MJPEG 客户端时缩短轮询等待；jpeg_seq 去重保证不会重复发帧。 */
         struct timeval tv = {
             .tv_sec = 0,
-            .tv_usec = have_mjpeg_client ? 5000 : 33000
+            .tv_usec = mjpeg_clients > 0 ? 5000 : 33000
         };
         int nready = select(max_fd + 1, &rd_set, NULL, NULL, &tv);
+        const double now = monotonic_sec();
 
-        /* 新连接 */
-        if (nready > 0 && FD_ISSET(listen_fd, &rd_set)) {
-            struct sockaddr_in cli_addr;
-            socklen_t cli_len = sizeof(cli_addr);
-            int cfd = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
-            if (cfd >= 0) {
-                if (client_count < MAX_HTTP_CLIENTS + MAX_WS_CLIENTS) {
-                    set_nonblock(cfd);
-                    client_t *nc = &clients[client_count++];
-                    memset(nc, 0, sizeof(*nc));
-                    nc->fd = cfd;
-                    nc->type = CLIENT_NEW;
-                } else {
-                    close(cfd);
-                }
-            }
+        if (nready < 0)
+            FD_ZERO(&rd_set);   /* its contents are undefined after an error */
+
+        if (capture_stalled(now)) {
+            LOG_E("capture thread is stuck; exiting for a restart");
+            cam_log_close();
+            _exit(EX_SOFTWARE);
         }
 
-        /* 处理客户端 */
+        if (nready > 0 && signal_fd >= 0 && FD_ISSET(signal_fd, &rd_set) &&
+            read_shutdown_signal(signal_fd)) {
+            app_state_store_int(&g_state.quit, 1);
+            app_state_store_int(&server_running, 0);
+            break;
+        }
+
+        /* 新连接 */
+        if (nready > 0 && FD_ISSET(listen_fd, &rd_set))
+            accept_client(now);
+
+        /* 广播检测结果或状态变化给 WS 客户端。先于 MJPEG：慢客户端的发送会占住这个循环。 */
+        static unsigned int last_det_seq = 0;
+        static unsigned int last_status_seq = 0;
+        static double last_broadcast_sec = 0.0;
+        unsigned int det_seq = app_state_load_u32(&g_state.det_seq);
+        unsigned int status_seq = app_state_load_u32(&g_state.status_seq);
+
+        /* The periodic message keeps the counters in the page moving, and gives a client that just
+         * connected the state of the board. */
+        if (det_seq != last_det_seq || status_seq != last_status_seq ||
+            now - last_broadcast_sec >= WS_STATUS_PERIOD_SEC) {
+            last_det_seq = det_seq;
+            last_status_seq = status_seq;
+            last_broadcast_sec = now;
+            net_ws_broadcast_detections();
+        }
+
         for (int i = 0; i < client_count; ) {
             client_t *c = &clients[i];
-            int remove = 0;
+            int remove = FD_ISSET(c->fd, &rd_set) && client_receive(c) < 0;
 
-            /* 读数据（新连接和 WS） */
-            if (FD_ISSET(c->fd, &rd_set)) {
-                int space = sizeof(c->recv_buf) - c->recv_len - 1;
-                if (space > 0) {
-                    ssize_t n = recv(c->fd, c->recv_buf + c->recv_len, space, 0);
-                    if (n <= 0) {
-                        remove = 1;
-                    } else {
-                        c->recv_len += n;
-                        c->recv_buf[c->recv_len] = '\0';
+            if (!remove && c->type == CLIENT_NEW &&
+                now - c->accepted_sec > HTTP_REQUEST_TIMEOUT_SEC)
+                remove = 1;
 
-                        if (c->type == CLIENT_NEW) {
-                            int complete = http_request_complete(c);
-                            if (complete < 0) {
-                                remove = 1;
-                            } else if (complete > 0) {
-                                handle_http_request(c);
-                                if (c->type == CLIENT_API) {
-                                    remove = 1;
-                                }
-                                c->recv_len = 0;
-                            }
-                        }
-                        /* WS: 接收 APP 发来的消息 */
-                        if (c->type == CLIENT_WS && c->ws_handshake_done) {
-                            if (ws_process_recv_buffer(c) < 0)
-                                remove = 1;
-                        }
-                    }
-                } else {
-                    remove = 1;
-                }
-            }
-
-            /* MJPEG 推帧 */
-            if (!remove && c->type == CLIENT_MJPEG) {
-                if (send_mjpeg_frame(c) < 0) {
-                    remove = 1;
-                }
-            }
+            if (!remove && c->type == CLIENT_MJPEG)
+                remove = send_mjpeg_frame(c) < 0;
 
             if (remove) {
                 client_remove(i);
             } else {
                 i++;
             }
-        }
-
-        /* 广播检测结果或状态变化给 WS 客户端 */
-        static unsigned int last_det_seq = 0;
-        static unsigned int last_status_seq = 0;
-        unsigned int det_seq = app_state_load_u32(&g_state.det_seq);
-        unsigned int status_seq = app_state_load_u32(&g_state.status_seq);
-
-        if (det_seq != last_det_seq || status_seq != last_status_seq) {
-            last_det_seq = det_seq;
-            last_status_seq = status_seq;
-            net_ws_broadcast_detections();
         }
     }
 
@@ -783,7 +811,8 @@ void net_ws_broadcast_detections(void)
 
     char json[4096];
     int pos = 0;
-    detection_t det_snapshot[DETECTOR_MAX_DETECTIONS];
+    status_fields_t status;
+    detection_t det_snapshot[DETECTOR_MAX_DET];
     char frame_sequence_json[48];
     unsigned int det_frame_seq;
     int count;
@@ -793,8 +822,7 @@ void net_ws_broadcast_detections(void)
     pthread_mutex_lock(&g_state.det_mutex);
     count = g_state.det_count;
     if (count < 0) count = 0;
-    if (count > DETECTOR_MAX_DETECTIONS)
-        count = DETECTOR_MAX_DETECTIONS;
+    if (count > DETECTOR_MAX_DET) count = DETECTOR_MAX_DET;
     det_frame_seq = g_state.det_frame_seq;
     memcpy(det_snapshot, g_state.detections,
            (size_t)count * sizeof(detection_t));
@@ -804,15 +832,16 @@ void net_ws_broadcast_detections(void)
                                            det_frame_seq) < 0)
         return;
 
+    collect_status(&status);
     pos = json_append(json, sizeof(json), pos, "{\"status\":{");
-    pos = append_status_fields(json, sizeof(json), pos);
+    pos = status_json_append_fields(json, sizeof(json), pos, &status);
     pos = json_append(json, sizeof(json), pos,
                       "},%s,\"detections\":[", frame_sequence_json);
     if (pos < 0)
         return;
 
     int published = 0;
-    for (int i = 0; i < count && i < DETECTOR_MAX_DETECTIONS; i++) {
+    for (int i = 0; i < count && i < DETECTOR_MAX_DET; i++) {
         detection_t *d = &det_snapshot[i];
         if (!d->publish)
             continue;

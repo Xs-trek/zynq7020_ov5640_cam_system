@@ -1,4 +1,6 @@
 /* cmd_handler.c — HTTP API 命令处理*/
+#define LOG_TAG "cmd"
+
 #include "network/cmd_handler.h"
 #include "platform/hal_ov5640.h"
 #include "cam_system/app_state.h"
@@ -6,6 +8,7 @@
 #include "cam_system/tracker.h"
 #include "cam_system/config.h"
 #include "cjson/cJSON.h"
+#include "common/log.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,7 +18,7 @@ extern tracker_t g_tracker;
 typedef enum {
     API_ROUTE_UNKNOWN = 0,
     API_ROUTE_CAMERA,
-    API_ROUTE_DETECTOR,
+    API_ROUTE_YOLO,
     API_ROUTE_TRACK,
     API_ROUTE_ZOOM,
     API_ROUTE_SETTINGS,
@@ -85,7 +88,7 @@ static api_route_t api_route_from_request(const char *request)
     if (strcmp(path, "/api/camera") == 0)
         return API_ROUTE_CAMERA;
     if (strcmp(path, "/api/yolo") == 0)
-        return API_ROUTE_DETECTOR;
+        return API_ROUTE_YOLO;
     if (strcmp(path, "/api/track") == 0)
         return API_ROUTE_TRACK;
     if (strcmp(path, "/api/zoom") == 0)
@@ -171,6 +174,7 @@ static void make_response(char *resp, size_t sz, int code,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json\r\n"
         "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n"
         "Content-Length: %zu\r\n\r\n%s",
         code, status, strlen(json_body), json_body);
 }
@@ -185,15 +189,12 @@ void cmd_handle_api(const char *request, const char *body,
         cJSON *en = json ? cJSON_GetObjectItem(json, "enabled") : NULL;
         if (en && cJSON_IsBool(en)) {
             int enable = cJSON_IsTrue(en);
+            /* The capture thread carries out a camera off (capture/camera_switch.c): it stops the
+             * tracker while the stream still runs, disables detection and clears the outputs. */
             app_state_store_int(&g_state.cam_enabled, enable);
-            if (!enable) {
-                app_state_store_int(&g_state.detector_enabled, 0);
-                clear_detection_and_tracking_outputs();
-                queue_track_stop_best_effort();
-            }
             frame_mailbox_wake_all(&g_state);
             notify_status_changed();
-            printf("[cmd] Camera %s\n", enable ? "ON" : "OFF");
+            LOG_I("Camera %s", enable ? "ON" : "OFF");
             make_response(response, resp_size, 200, "OK",
                          "{\"status\":\"ok\"}");
         } else {
@@ -201,7 +202,7 @@ void cmd_handle_api(const char *request, const char *body,
                          "{\"error\":\"missing enabled\"}");
         }
 
-    } else if (route == API_ROUTE_DETECTOR) {
+    } else if (route == API_ROUTE_YOLO) {
         cJSON *en = json ? cJSON_GetObjectItem(json, "enabled") : NULL;
         if (en && cJSON_IsBool(en)) {
             int enable = cJSON_IsTrue(en);
@@ -212,8 +213,8 @@ void cmd_handle_api(const char *request, const char *body,
             }
             frame_mailbox_wake_all(&g_state);
             notify_status_changed();
-            printf("[cmd] Detector %s\n",
-                   enable ? "ON" : "OFF");
+            LOG_I("YOLO %s",
+                  enable ? "ON" : "OFF");
             make_response(response, resp_size, 200, "OK",
                          "{\"status\":\"ok\"}");
         } else {
@@ -227,7 +228,7 @@ void cmd_handle_api(const char *request, const char *body,
 
             if (strcmp(act->valuestring, "stop") == 0) {
                 if (queue_track_cmd(TRACK_CMD_STOP, -1) == 0) {
-                    printf("[cmd] Track stop queued\n");
+                    LOG_I("Track stop queued");
                     make_response(response, resp_size, 200, "OK",
                                  "{\"status\":\"ok\"}");
                 } else {
@@ -236,7 +237,7 @@ void cmd_handle_api(const char *request, const char *body,
                 }
             } else if (strcmp(act->valuestring, "start") == 0) {
                 if (queue_track_cmd(TRACK_CMD_START, -1) == 0) {
-                    printf("[cmd] Track start queued\n");
+                    LOG_I("Track start queued");
                     make_response(response, resp_size, 200, "OK",
                                  "{\"status\":\"ok\"}");
                 } else {
@@ -247,8 +248,8 @@ void cmd_handle_api(const char *request, const char *body,
                 cJSON *tid = cJSON_GetObjectItem(json, "target_id");
                 if (tid && cJSON_IsNumber(tid) && tid->valueint >= 0) {
                     if (queue_track_cmd(TRACK_CMD_SELECT, tid->valueint) == 0) {
-                        printf("[cmd] Track select queued target=%d\n",
-                               tid->valueint);
+                        LOG_I("Track select queued target=%d",
+                              tid->valueint);
                         make_response(response, resp_size, 200, "OK",
                                      "{\"status\":\"ok\"}");
                     } else {
@@ -280,7 +281,7 @@ void cmd_handle_api(const char *request, const char *body,
             return;
         }
 
-        int new_classes[YOLO_NUM_CLASSES];
+        int new_classes[DETECTOR_MAX_CLASSES];
         int new_class_count = -1;
         int new_max_det = -1;
         int settings_error = 0;
@@ -292,11 +293,11 @@ void cmd_handle_api(const char *request, const char *body,
             cJSON_ArrayForEach(item, cls) {
                 if (!cJSON_IsNumber(item) ||
                     item->valueint < 0 ||
-                    item->valueint >= YOLO_NUM_CLASSES) {
+                    item->valueint >= DETECTOR_MAX_CLASSES) {
                     settings_error = 1;
                     break;
                 }
-                if (new_class_count < YOLO_NUM_CLASSES)
+                if (new_class_count < DETECTOR_MAX_CLASSES)
                     new_classes[new_class_count++] = item->valueint;
             }
         } else if (cls) {
@@ -305,8 +306,7 @@ void cmd_handle_api(const char *request, const char *body,
 
         cJSON *md = cJSON_GetObjectItem(json, "max_det");
         if (md && cJSON_IsNumber(md)) {
-            new_max_det = clamp_int(md->valueint, 0,
-                                    DETECTOR_MAX_DETECTIONS);
+            new_max_det = clamp_int(md->valueint, 0, DETECTOR_MAX_DET);
         } else if (md) {
             settings_error = 1;
         }
@@ -327,7 +327,7 @@ void cmd_handle_api(const char *request, const char *body,
         if (new_max_det >= 0)
             g_state.max_det = new_max_det;
         pthread_mutex_unlock(&g_state.settings_mutex);
-        printf("[cmd] Settings updated\n");
+        LOG_I("Settings updated");
         make_response(response, resp_size, 200, "OK",
                      "{\"status\":\"ok\"}");
 

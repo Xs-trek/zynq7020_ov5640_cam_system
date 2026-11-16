@@ -110,6 +110,8 @@ typedef struct {
 } tracker_t;
 
 void tracker_init(tracker_t *trk);
+/* Diagnostics only: verbose logging and the periodic summary interval (0 = off). */
+void tracker_set_diagnostics(int verbose, float diag_every_sec);
 void tracker_apply_cmd(tracker_t *trk, track_cmd_t cmd, int tid);
 void tracker_update_detections(tracker_t *trk,
                                detection_t *dets, int det_count,
@@ -119,9 +121,16 @@ void tracker_predict(tracker_t *trk, double time_sec);
 int tracker_is_active(const tracker_t *trk);
 int tracker_get_target_id(const tracker_t *trk);
 track_state_t tracker_get_state(const tracker_t *trk);
+const char *tracker_state_name(track_state_t state);
+/* A detection's control point (the face anchor) and size in the absolute 1312x972 plane. */
+void tracker_det_to_abs(const detection_t *det, const frame_view_t *view,
+                        float *cx, float *cy, float *width, float *height);
 void tracker_stop(tracker_t *trk);
 void tracker_reset_frame_flag(void);
 void tracker_get_isp_offset(int *xoff, int *yoff);
+/* The sensor was initialized: its register table turned the scaler on and set the default
+ * offset.  Sets the tracker's copies to match.  Call with the tracker idle. */
+void tracker_sensor_initialized(void);
 int tracker_write_isp_offset(int x, int y);
 void tracker_snapshot_view(frame_view_t *view, int xoff, int yoff,
                            unsigned int frame_seq, double capture_time_sec);

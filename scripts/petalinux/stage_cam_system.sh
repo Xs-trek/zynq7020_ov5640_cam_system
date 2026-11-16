@@ -35,10 +35,13 @@ git -C "${ROOT_DIR}" archive --format=tar --prefix=cam_system-src/ HEAD -- \
     CMakeLists.txt \
     assets \
     cmake \
+    config \
     include \
     src \
     third_party/cjson \
-    third_party/face_accel_ref | gzip -n > "${SOURCE_ARCHIVE}"
+    third_party/libfacedetection \
+    third_party/face_accel_ref \
+    third_party/ultraface | gzip -n > "${SOURCE_ARCHIVE}"
 
 {
     printf 'git_commit %s\n' "${git_commit}"

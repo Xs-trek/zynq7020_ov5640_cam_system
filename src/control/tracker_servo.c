@@ -140,20 +140,41 @@ static void step_axis(tracker_view_axis_t *axis,
                      3.0f * omega * omega *
                          (target_velocity - axis->vel) -
                      3.0f * omega * axis->accel;
-    /* Boundary reference governor.  Projection alone would turn a non-zero
-     * final command step into zero at the pan limit, which is perceived as a
-     * tear.  Begin maximum-jerk braking when the analytically conservative
-     * S-curve stopping distance reaches the remaining range. */
-    if (axis->vel > 0.0f &&
-        conservative_stop_distance(axis->vel, axis->accel,
-                                   max_acceleration, max_jerk) >=
-            maximum - axis->pos) {
-        requested_jerk = -max_jerk;
-    } else if (axis->vel < 0.0f &&
-               conservative_stop_distance(-axis->vel, -axis->accel,
-                                          max_acceleration, max_jerk) >=
-                   axis->pos - minimum) {
-        requested_jerk = max_jerk;
+    /* Boundary brake (docs/V020_RELEASE_NOTES.md).  Look one frame ahead with the jerk the
+     * law asks for: when the S-curve stopping distance from that state, plus
+     * one frame, no longer fits in the remaining range, brake towards the
+     * constant deceleration that ends at the pan limit, within the normal
+     * acceleration and jerk limits.  The path then arrives at the limit at
+     * rest instead of being stopped there by the projection below. */
+    {
+        float j_try = clampf_servo(requested_jerk, -max_jerk, max_jerk);
+        float a_next = clampf_servo(axis->accel + j_try * dt,
+                                    -max_acceleration, max_acceleration);
+        float v_next = clampf_servo(axis->vel + a_next * dt,
+                                    -max_velocity, max_velocity);
+        float p_next = axis->pos + v_next * dt;
+
+        if (v_next > 0.0f &&
+            conservative_stop_distance(v_next, a_next, max_acceleration,
+                                       max_jerk) + v_next * dt >=
+                maximum - p_next) {
+            float room = fmaxf(maximum - axis->pos - axis->vel * dt, 0.5f);
+            float a_stop = fmaxf(-axis->vel * axis->vel / (2.0f * room),
+                                 -max_acceleration);
+
+            requested_jerk = fminf(requested_jerk,
+                                   (a_stop - axis->accel) / dt);
+        } else if (v_next < 0.0f &&
+                   conservative_stop_distance(-v_next, -a_next,
+                                              max_acceleration, max_jerk) -
+                       v_next * dt >= p_next - minimum) {
+            float room = fmaxf(axis->pos - minimum + axis->vel * dt, 0.5f);
+            float a_stop = fminf(axis->vel * axis->vel / (2.0f * room),
+                                 max_acceleration);
+
+            requested_jerk = fmaxf(requested_jerk,
+                                   (a_stop - axis->accel) / dt);
+        }
     }
     requested_jerk = clampf_servo(requested_jerk, -max_jerk, max_jerk);
     axis->accel = clampf_servo(axis->accel + requested_jerk * dt,

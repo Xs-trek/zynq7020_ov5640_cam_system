@@ -1,4 +1,4 @@
-SUMMARY = "Camera streaming, PL face detection, and digital-gimbal tracking"
+SUMMARY = "Camera system with camera streaming, tracking and detector candidates"
 SECTION = "PETALINUX/apps"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
@@ -12,11 +12,14 @@ S = "${WORKDIR}/cam_system-src"
 
 inherit cmake pkgconfig
 
-DEPENDS = "ncnn libjpeg-turbo openssl"
+# The product build uses the PL detector only; ncnn is needed only with
+# -DCAM_SYSTEM_ENABLE_CPU_DETECTORS=ON.
+DEPENDS = "libjpeg-turbo openssl"
 
 EXTRA_OECMAKE += " \
     -DCAM_SYSTEM_DEPENDENCY_MODE=YOCTO \
     -DCAM_SYSTEM_ENABLE_WARNINGS=ON \
+    -DCAM_SYSTEM_ENABLE_CPU_DETECTORS=OFF \
     -DCMAKE_SKIP_RPATH=ON \
     "
 
@@ -38,4 +41,7 @@ FILES:${PN} += " \
     ${bindir}/cam_system \
     ${CAM_SYSTEM_MODEL_DIR} \
     ${CAM_SYSTEM_MANIFEST_DIR}/cam-system-artifacts.sha256 \
+    ${sysconfdir}/cam_system.conf \
     "
+
+CONFFILES:${PN} += "${sysconfdir}/cam_system.conf"

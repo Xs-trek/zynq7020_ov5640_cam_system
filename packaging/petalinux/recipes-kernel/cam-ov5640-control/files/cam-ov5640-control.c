@@ -6,6 +6,20 @@
  * fixed 640x480 RGB565 DVP mode, software standby, ISP offset group write,
  * and scaler enable/disable. Frame capture remains in the existing PL
  * frmbuf path and is not exposed as a V4L2 video node.
+ *
+ * The ISP offset is written inside group hold 3 so that the four offset
+ * registers take effect on the same frame. If any write of the group fails,
+ * or the group misses its time budget, the hold is closed without a launch:
+ * a partial offset never reaches the sensor and later direct register writes
+ * are not captured into group memory. Failure counters are exposed as
+ * read-only controls.
+ *
+ * Power: the sensor is powered (clock on, out of power-down and reset) only
+ * while someone uses it: an open subdev file handle, or a running stream.
+ * Probe powers it down again after reading the chip id. The last close of a
+ * file handle, which also happens when the process holding it is killed,
+ * powers it down unless the stream still runs; stopping the stream then does.
+ * Power-down loses the register state, so the next user initializes again.
  */
 
 #include <linux/clk.h>
@@ -27,11 +41,29 @@
 #define CAM_OV5640_CID_STANDBY       (CAM_OV5640_CID_BASE + 1)
 #define CAM_OV5640_CID_ISP_OFFSET    (CAM_OV5640_CID_BASE + 2)
 #define CAM_OV5640_CID_SCALER_ENABLE (CAM_OV5640_CID_BASE + 3)
+#define CAM_OV5640_CID_WRITE_FAILURES (CAM_OV5640_CID_BASE + 4)
+#define CAM_OV5640_CID_GROUP_ABORTS  (CAM_OV5640_CID_BASE + 5)
+#define CAM_OV5640_CID_TEST_PATTERN  (CAM_OV5640_CID_BASE + 6)
 
 #define OV5640_CHIP_ID_REG 0x300a
 #define OV5640_REG_SYS_CTRL0 0x3008
 #define OV5640_REG_SYS_CTRL0_SW_PWDN 0x42
 #define OV5640_REG_SYS_CTRL0_SW_PWUP 0x02
+#define OV5640_REG_GROUP_ACCESS 0x3212
+#define OV5640_REG_PRE_ISP_TEST 0x503d
+#define OV5640_REG_PRE_ISP_TEST_COLOR_BAR 0x80
+#define OV5640_GROUP3_HOLD_START 0x03
+#define OV5640_GROUP3_HOLD_END 0x13
+#define OV5640_GROUP3_LAUNCH 0xa3
+
+#define CAM_OV5640_WRITE_ATTEMPTS 3
+#define CAM_OV5640_RETRY_US 5000
+#define CAM_OV5640_GROUP_RETRY_US 1000
+/*
+ * Upper bound for one ISP offset group, retries included. The caller is the
+ * per-frame control tick, which has one 33 ms frame period in total.
+ */
+#define CAM_OV5640_GROUP_BUDGET_MS 20
 
 #define ISP_DEFAULT_XOFF 16
 #define ISP_DEFAULT_YOFF 4
@@ -127,17 +159,18 @@ struct cam_ov5640 {
 	struct clk *xclk;
 	struct gpio_desc *pwdn_gpio;
 	struct gpio_desc *reset_gpio;
-	struct mutex lock;
+	struct mutex lock;	/* sensor state, bus access and controls */
 	struct v4l2_subdev sd;
 	struct media_pad pad;
 	struct v4l2_mbus_framefmt format;
 	struct v4l2_ctrl_handler ctrls;
 	bool powered;
 	bool initialized;
-	bool standby;
-	bool scaler_enabled;
-	u16 xoff;
-	u16 yoff;
+	bool group_open;
+	bool streaming;
+	unsigned int open_count;
+	u32 write_failures;
+	u32 group_aborts;
 };
 
 static inline struct cam_ov5640 *to_cam_ov5640(struct v4l2_subdev *sd)
@@ -165,23 +198,53 @@ static void cam_ov5640_hw_reset(struct cam_ov5640 *sensor)
 	usleep_range(50000, 60000);
 }
 
-static int cam_ov5640_write_reg(struct cam_ov5640 *sensor, u16 reg, u8 val)
+/*
+ * Writes one register with up to CAM_OV5640_WRITE_ATTEMPTS attempts. With a
+ * deadline, no attempt starts after it. Called with sensor->lock held, or
+ * from probe before the device is registered.
+ */
+static int cam_ov5640_write_reg_bounded(struct cam_ov5640 *sensor, u16 reg,
+					u8 val, const unsigned long *deadline,
+					unsigned int retry_us)
 {
 	u8 buf[3] = { reg >> 8, reg & 0xff, val };
-	int ret;
-	int retry;
+	int ret = -EIO;
+	int attempt;
 
-	for (retry = 0; retry < 3; retry++) {
+	for (attempt = 0; attempt < CAM_OV5640_WRITE_ATTEMPTS; attempt++) {
+		if (deadline && time_after(jiffies, *deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (attempt)
+			usleep_range(retry_us, retry_us + 1000);
 		ret = i2c_master_send(sensor->client, buf, sizeof(buf));
 		if (ret == sizeof(buf))
 			return 0;
-		usleep_range(5000, 6000);
 	}
 
-	dev_err(&sensor->client->dev,
-		"I2C write failed reg=0x%04x val=0x%02x ret=%d\n",
-		reg, val, ret);
+	sensor->write_failures++;
+	dev_err_ratelimited(&sensor->client->dev,
+			    "I2C write failed reg=0x%04x val=0x%02x ret=%d\n",
+			    reg, val, ret);
 	return ret < 0 ? ret : -EIO;
+}
+
+static int cam_ov5640_write_reg(struct cam_ov5640 *sensor, u16 reg, u8 val)
+{
+	return cam_ov5640_write_reg_bounded(sensor, reg, val, NULL,
+					    CAM_OV5640_RETRY_US);
+}
+
+/* Ends group hold 3 without launching it; see the comment at the top. */
+static int cam_ov5640_group_close(struct cam_ov5640 *sensor)
+{
+	int ret;
+
+	ret = cam_ov5640_write_reg(sensor, OV5640_REG_GROUP_ACCESS,
+				   OV5640_GROUP3_HOLD_END);
+	sensor->group_open = ret != 0;
+	return ret;
 }
 
 static int cam_ov5640_read_reg(struct cam_ov5640 *sensor, u16 reg, u8 *val)
@@ -225,6 +288,7 @@ static int cam_ov5640_power_on(struct cam_ov5640 *sensor)
 	cam_ov5640_hw_reset(sensor);
 
 	sensor->powered = true;
+	dev_info(&sensor->client->dev, "sensor powered up\n");
 	return 0;
 }
 
@@ -241,6 +305,16 @@ static void cam_ov5640_power_off(struct cam_ov5640 *sensor)
 		clk_disable_unprepare(sensor->xclk);
 
 	sensor->powered = false;
+	sensor->initialized = false;
+	sensor->group_open = false;
+	dev_info(&sensor->client->dev, "sensor powered down\n");
+}
+
+/* Powers the sensor down once nothing uses it. Called with sensor->lock held. */
+static void cam_ov5640_release_power(struct cam_ov5640 *sensor)
+{
+	if (!sensor->open_count && !sensor->streaming)
+		cam_ov5640_power_off(sensor);
 }
 
 static int cam_ov5640_check_id(struct cam_ov5640 *sensor)
@@ -254,9 +328,10 @@ static int cam_ov5640_check_id(struct cam_ov5640 *sensor)
 		return ret;
 
 	ret = cam_ov5640_read_reg(sensor, OV5640_CHIP_ID_REG, &id_h);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_read_reg(sensor, OV5640_CHIP_ID_REG + 1, &id_l);
+	if (!ret)
+		ret = cam_ov5640_read_reg(sensor, OV5640_CHIP_ID_REG + 1, &id_l);
+	/* Nobody uses the sensor yet; the first user powers it up again. */
+	cam_ov5640_power_off(sensor);
 	if (ret)
 		return ret;
 
@@ -272,16 +347,14 @@ static int cam_ov5640_check_id(struct cam_ov5640 *sensor)
 	return 0;
 }
 
+/* Called with the sensor powered. */
 static int cam_ov5640_write_table(struct cam_ov5640 *sensor)
 {
 	size_t i;
 	int ret;
 
-	ret = cam_ov5640_power_on(sensor);
-	if (ret)
-		return ret;
-
 	cam_ov5640_hw_reset(sensor);
+	sensor->group_open = false;
 
 	for (i = 0; i < ARRAY_SIZE(cam_ov5640_init_regs); i++) {
 		ret = cam_ov5640_write_reg(sensor,
@@ -301,16 +374,15 @@ static int cam_ov5640_write_table(struct cam_ov5640 *sensor)
 	}
 
 	sensor->initialized = true;
-	sensor->standby = false;
-	sensor->scaler_enabled = true;
-	sensor->xoff = ISP_DEFAULT_XOFF;
-	sensor->yoff = ISP_DEFAULT_YOFF;
 	dev_info(&sensor->client->dev, "fixed VGA RGB565 mode initialized\n");
 	return 0;
 }
 
 static int cam_ov5640_apply_offset(struct cam_ov5640 *sensor, u16 xoff, u16 yoff)
 {
+	struct cam_ov5640_reg group[6];
+	unsigned long deadline;
+	unsigned int i;
 	int ret;
 
 	if (xoff > PAN_MAX_X)
@@ -318,31 +390,37 @@ static int cam_ov5640_apply_offset(struct cam_ov5640 *sensor, u16 xoff, u16 yoff
 	if (yoff > PAN_MAX_Y)
 		yoff = PAN_MAX_Y;
 
-	ret = cam_ov5640_write_reg(sensor, 0x3212, 0x03);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3810, (xoff >> 8) & 0x0f);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3811, xoff & 0xff);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3812, (yoff >> 8) & 0x07);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3813, yoff & 0xff);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3212, 0x13);
-	if (ret)
-		return ret;
-	ret = cam_ov5640_write_reg(sensor, 0x3212, 0xa3);
-	if (ret)
-		return ret;
+	group[0] = (struct cam_ov5640_reg){ OV5640_REG_GROUP_ACCESS,
+					    OV5640_GROUP3_HOLD_START };
+	group[1] = (struct cam_ov5640_reg){ 0x3810, (xoff >> 8) & 0x0f };
+	group[2] = (struct cam_ov5640_reg){ 0x3811, xoff & 0xff };
+	group[3] = (struct cam_ov5640_reg){ 0x3812, (yoff >> 8) & 0x07 };
+	group[4] = (struct cam_ov5640_reg){ 0x3813, yoff & 0xff };
+	group[5] = (struct cam_ov5640_reg){ OV5640_REG_GROUP_ACCESS,
+					    OV5640_GROUP3_HOLD_END };
 
-	sensor->xoff = xoff;
-	sensor->yoff = yoff;
-	return 0;
+	deadline = jiffies + msecs_to_jiffies(CAM_OV5640_GROUP_BUDGET_MS);
+	sensor->group_open = true;
+	for (i = 0; i < ARRAY_SIZE(group); i++) {
+		ret = cam_ov5640_write_reg_bounded(sensor, group[i].addr,
+						   group[i].val, &deadline,
+						   CAM_OV5640_GROUP_RETRY_US);
+		if (ret)
+			goto abort;
+	}
+	sensor->group_open = false;
+
+	ret = cam_ov5640_write_reg_bounded(sensor, OV5640_REG_GROUP_ACCESS,
+					   OV5640_GROUP3_LAUNCH, &deadline,
+					   CAM_OV5640_GROUP_RETRY_US);
+	if (ret)
+		sensor->group_aborts++;
+	return ret;
+
+abort:
+	sensor->group_aborts++;
+	cam_ov5640_group_close(sensor);
+	return ret;
 }
 
 static int cam_ov5640_set_scaler(struct cam_ov5640 *sensor, bool enabled)
@@ -359,18 +437,40 @@ static int cam_ov5640_set_scaler(struct cam_ov5640 *sensor, bool enabled)
 	else
 		val &= ~0x20;
 
-	ret = cam_ov5640_write_reg(sensor, 0x5001, val);
-	if (ret)
-		return ret;
+	return cam_ov5640_write_reg(sensor, 0x5001, val);
+}
 
-	sensor->scaler_enabled = enabled;
-	return 0;
+static int cam_ov5640_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct cam_ov5640 *sensor = ctrl_to_cam_ov5640(ctrl);
+
+	switch (ctrl->id) {
+	case CAM_OV5640_CID_WRITE_FAILURES:
+		ctrl->val = sensor->write_failures & S32_MAX;
+		return 0;
+	case CAM_OV5640_CID_GROUP_ABORTS:
+		ctrl->val = sensor->group_aborts & S32_MAX;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int cam_ov5640_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct cam_ov5640 *sensor = ctrl_to_cam_ov5640(ctrl);
 	int ret = 0;
+
+	/* Writes come through an open file handle, which holds the power. */
+	if (!sensor->powered)
+		return -EIO;
+
+	/* A hold left open by a failed close would capture this write. */
+	if (sensor->group_open && ctrl->id != CAM_OV5640_CID_INITIALIZE) {
+		ret = cam_ov5640_group_close(sensor);
+		if (ret)
+			return ret;
+	}
 
 	switch (ctrl->id) {
 	case CAM_OV5640_CID_INITIALIZE:
@@ -383,11 +483,8 @@ static int cam_ov5640_s_ctrl(struct v4l2_ctrl *ctrl)
 		else
 			ret = cam_ov5640_write_reg(sensor, OV5640_REG_SYS_CTRL0,
 						   OV5640_REG_SYS_CTRL0_SW_PWUP);
-		if (!ret) {
-			sensor->standby = ctrl->val;
-			if (!ctrl->val)
-				msleep(500);
-		}
+		if (!ret && !ctrl->val)
+			msleep(500);
 		break;
 	case CAM_OV5640_CID_ISP_OFFSET:
 		ret = cam_ov5640_apply_offset(sensor,
@@ -396,6 +493,10 @@ static int cam_ov5640_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case CAM_OV5640_CID_SCALER_ENABLE:
 		ret = cam_ov5640_set_scaler(sensor, ctrl->val);
+		break;
+	case CAM_OV5640_CID_TEST_PATTERN:
+		ret = cam_ov5640_write_reg(sensor, OV5640_REG_PRE_ISP_TEST,
+					   ctrl->val ? OV5640_REG_PRE_ISP_TEST_COLOR_BAR : 0);
 		break;
 	default:
 		ret = -EINVAL;
@@ -406,9 +507,16 @@ static int cam_ov5640_s_ctrl(struct v4l2_ctrl *ctrl)
 }
 
 static const struct v4l2_ctrl_ops cam_ov5640_ctrl_ops = {
+	.g_volatile_ctrl = cam_ov5640_g_volatile_ctrl,
 	.s_ctrl = cam_ov5640_s_ctrl,
 };
 
+/*
+ * Initialize resets the sensor behind the cached values of these controls, and a process that
+ * restarts after a crash writes them again.  The control framework drops a write of the cached
+ * value, so without EXECUTE_ON_WRITE such a write would never reach the sensor.  Their callers
+ * write on change, so this adds no traffic.
+ */
 static const struct v4l2_ctrl_config cam_ov5640_ctrls[] = {
 	{
 		.ops = &cam_ov5640_ctrl_ops,
@@ -421,6 +529,7 @@ static const struct v4l2_ctrl_config cam_ov5640_ctrls[] = {
 		.id = CAM_OV5640_CID_STANDBY,
 		.name = "Standby",
 		.type = V4L2_CTRL_TYPE_BOOLEAN,
+		.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.min = 0,
 		.max = 1,
 		.step = 1,
@@ -431,6 +540,7 @@ static const struct v4l2_ctrl_config cam_ov5640_ctrls[] = {
 		.id = CAM_OV5640_CID_ISP_OFFSET,
 		.name = "ISP Offset",
 		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.min = 0,
 		.max = 0x0fff0fff,
 		.step = 1,
@@ -441,10 +551,44 @@ static const struct v4l2_ctrl_config cam_ov5640_ctrls[] = {
 		.id = CAM_OV5640_CID_SCALER_ENABLE,
 		.name = "Scaler Enable",
 		.type = V4L2_CTRL_TYPE_BOOLEAN,
+		.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 		.min = 0,
 		.max = 1,
 		.step = 1,
 		.def = 1,
+	},
+	{
+		.ops = &cam_ov5640_ctrl_ops,
+		.id = CAM_OV5640_CID_TEST_PATTERN,
+		.name = "Color Bar Test Pattern",
+		.type = V4L2_CTRL_TYPE_BOOLEAN,
+		.flags = V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+		.min = 0,
+		.max = 1,
+		.step = 1,
+		.def = 0,
+	},
+	{
+		.ops = &cam_ov5640_ctrl_ops,
+		.id = CAM_OV5640_CID_WRITE_FAILURES,
+		.name = "I2C Write Failures",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+		.min = 0,
+		.max = S32_MAX,
+		.step = 1,
+		.def = 0,
+	},
+	{
+		.ops = &cam_ov5640_ctrl_ops,
+		.id = CAM_OV5640_CID_GROUP_ABORTS,
+		.name = "ISP Offset Group Aborts",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+		.min = 0,
+		.max = S32_MAX,
+		.step = 1,
+		.def = 0,
 	},
 };
 
@@ -453,14 +597,18 @@ static int cam_ov5640_init_controls(struct cam_ov5640 *sensor)
 	struct v4l2_ctrl_handler *hdl = &sensor->ctrls;
 	unsigned int i;
 
-	v4l2_ctrl_handler_init(hdl, 4);
+	v4l2_ctrl_handler_init(hdl, ARRAY_SIZE(cam_ov5640_ctrls));
 	hdl->lock = &sensor->lock;
 
 	for (i = 0; i < ARRAY_SIZE(cam_ov5640_ctrls); i++)
 		v4l2_ctrl_new_custom(hdl, &cam_ov5640_ctrls[i], NULL);
 
-	if (hdl->error)
-		return hdl->error;
+	if (hdl->error) {
+		int ret = hdl->error;
+
+		v4l2_ctrl_handler_free(hdl);
+		return ret;
+	}
 
 	sensor->sd.ctrl_handler = hdl;
 	return 0;
@@ -474,6 +622,13 @@ static void cam_ov5640_init_format(struct cam_ov5640 *sensor)
 	sensor->format.code = MEDIA_BUS_FMT_RGB565_2X8_LE;
 	sensor->format.field = V4L2_FIELD_NONE;
 	sensor->format.colorspace = V4L2_COLORSPACE_SRGB;
+}
+
+static int cam_ov5640_init_cfg(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_state *state)
+{
+	*v4l2_subdev_get_try_format(sd, state, 0) = to_cam_ov5640(sd)->format;
+	return 0;
 }
 
 static int cam_ov5640_enum_mbus_code(struct v4l2_subdev *sd,
@@ -545,41 +700,100 @@ static int cam_ov5640_set_fmt(struct v4l2_subdev *sd,
 	return 0;
 }
 
+/*
+ * A running stream holds the power: the process that started it may close the
+ * subdev before the stream stops, and the sensor going quiet in mid-frame
+ * would leave the DMA waiting.
+ */
 static int cam_ov5640_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct cam_ov5640 *sensor = to_cam_ov5640(sd);
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&sensor->lock);
+	if (enable) {
+		ret = cam_ov5640_power_on(sensor);
+		if (ret)
+			goto out;
+	} else {
+		sensor->streaming = false;
+		if (!sensor->powered)
+			goto out;
+	}
+
+	/* A hold left open by a failed close would capture the writes below. */
+	if (sensor->group_open) {
+		ret = cam_ov5640_group_close(sensor);
+		if (ret)
+			goto release;
+	}
 	if (enable) {
 		if (!sensor->initialized) {
 			ret = cam_ov5640_write_table(sensor);
 			if (ret)
-				goto out;
+				goto release;
 		}
 		ret = cam_ov5640_write_reg(sensor, OV5640_REG_SYS_CTRL0,
 					   OV5640_REG_SYS_CTRL0_SW_PWUP);
 		if (!ret) {
-			sensor->standby = false;
+			sensor->streaming = true;
 			msleep(500);
 		}
 	} else {
 		ret = cam_ov5640_write_reg(sensor, OV5640_REG_SYS_CTRL0,
 					   OV5640_REG_SYS_CTRL0_SW_PWDN);
-		if (!ret)
-			sensor->standby = true;
 	}
 
+release:
+	cam_ov5640_release_power(sensor);
 out:
 	mutex_unlock(&sensor->lock);
 	return ret;
 }
+
+/* Every open file handle holds the power, until it is closed or its process ends. */
+static int cam_ov5640_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+{
+	struct cam_ov5640 *sensor = to_cam_ov5640(sd);
+	int ret;
+
+	(void)fh;
+
+	mutex_lock(&sensor->lock);
+	ret = cam_ov5640_power_on(sensor);
+	if (!ret)
+		sensor->open_count++;
+	mutex_unlock(&sensor->lock);
+
+	return ret;
+}
+
+static int cam_ov5640_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+{
+	struct cam_ov5640 *sensor = to_cam_ov5640(sd);
+
+	(void)fh;
+
+	mutex_lock(&sensor->lock);
+	if (!WARN_ON(!sensor->open_count))
+		sensor->open_count--;
+	cam_ov5640_release_power(sensor);
+	mutex_unlock(&sensor->lock);
+
+	return 0;
+}
+
+static const struct v4l2_subdev_internal_ops cam_ov5640_internal_ops = {
+	.open = cam_ov5640_open,
+	.close = cam_ov5640_close,
+};
 
 static const struct v4l2_subdev_video_ops cam_ov5640_video_ops = {
 	.s_stream = cam_ov5640_s_stream,
 };
 
 static const struct v4l2_subdev_pad_ops cam_ov5640_pad_ops = {
+	.init_cfg = cam_ov5640_init_cfg,
 	.enum_mbus_code = cam_ov5640_enum_mbus_code,
 	.get_fmt = cam_ov5640_get_fmt,
 	.set_fmt = cam_ov5640_set_fmt,
@@ -605,9 +819,6 @@ static int cam_ov5640_probe(struct i2c_client *client)
 
 	sensor->client = client;
 	mutex_init(&sensor->lock);
-	sensor->scaler_enabled = true;
-	sensor->xoff = ISP_DEFAULT_XOFF;
-	sensor->yoff = ISP_DEFAULT_YOFF;
 	cam_ov5640_init_format(sensor);
 
 	sensor->xclk = devm_clk_get_optional(&client->dev, "xclk");
@@ -616,21 +827,23 @@ static int cam_ov5640_probe(struct i2c_client *client)
 		goto destroy_mutex;
 	}
 
+	/* Both lines start asserted: power-down and reset until the sensor is used. */
 	sensor->pwdn_gpio = devm_gpiod_get_optional(&client->dev, "powerdown",
-						    GPIOD_OUT_LOW);
+						    GPIOD_OUT_HIGH);
 	if (IS_ERR(sensor->pwdn_gpio)) {
 		ret = PTR_ERR(sensor->pwdn_gpio);
 		goto destroy_mutex;
 	}
 
 	sensor->reset_gpio = devm_gpiod_get_optional(&client->dev, "reset",
-						     GPIOD_OUT_LOW);
+						     GPIOD_OUT_HIGH);
 	if (IS_ERR(sensor->reset_gpio)) {
 		ret = PTR_ERR(sensor->reset_gpio);
 		goto destroy_mutex;
 	}
 
 	v4l2_i2c_subdev_init(&sensor->sd, client, &cam_ov5640_subdev_ops);
+	sensor->sd.internal_ops = &cam_ov5640_internal_ops;
 	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
@@ -692,6 +905,7 @@ MODULE_DEVICE_TABLE(i2c, cam_ov5640_id);
 static struct i2c_driver cam_ov5640_i2c_driver = {
 	.driver = {
 		.name = "cam-ov5640-control",
+		.suppress_bind_attrs = true,
 		.of_match_table = cam_ov5640_of_match,
 	},
 	.id_table = cam_ov5640_id,

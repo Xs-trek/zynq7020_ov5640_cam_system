@@ -1,0 +1,15 @@
+# Ultra-Light-Fast-Generic-Face-Detector-1MB NCNN
+
+Source: https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB
+
+Imported commit: dffdddda9794a50607cba8f318507a28c1c27cab
+
+License: MIT, see `LICENSE`.
+
+Scope:
+
+- Only the NCNN C++ wrapper is vendored here.  The `version-RFB/RFB-320` model
+  files are not redistributed in this repository; see `docs/MODEL_ASSETS.md`.
+- The full training, MNN, TFLite, Caffe, OpenCV-DNN and evaluation trees are
+  intentionally not vendored.
+- This project uses the model as a board-test candidate at 320x240 input.

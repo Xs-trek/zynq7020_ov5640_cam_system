@@ -1,5 +1,6 @@
 # 文档导航
 
+- [v0.2.0 发布说明](V020_RELEASE_NOTES.md)
 - [软件架构与接口](CAM_SYSTEM_SOFTWARE_TOP_LEVEL_SPEC.md)
 - [构建与链接](BUILD_AND_LINK_STANDARD.md)
 - [PetaLinux 集成](PETALINUX_PACKAGE_WORKFLOW.md)
@@ -11,5 +12,6 @@
 - [第三方组件与许可证](THIRD_PARTY_COMPONENTS.md)
 - [v0.1.1 发布说明](V011_RELEASE_NOTES.md)
 
-硬件导入方式见 [hardware/README.md](../hardware/README.md)。自动化测试统一通过
-`scripts/build/test_all_host.sh` 执行。
+硬件导入方式见 [hardware/README.md](../hardware/README.md)，手机页面见 [frontend/README.md](../frontend/README.md)。
+
+自动化测试统一由 `scripts/build/test_all_host.sh` 执行。

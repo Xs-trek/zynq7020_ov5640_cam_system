@@ -2,9 +2,13 @@
  *
  * 使用 TurboJPEG API（NEON 加速）
  */
+#define LOG_TAG "jpeg"
+
 #include "media/jpeg_enc.h"
 #include "cam_system/app_state.h"
 #include "cam_system/config.h"
+#include "common/app_config.h"
+#include "common/log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,12 +17,14 @@
 static tjhandle tj_handle = NULL;
 static unsigned char *tj_buf = NULL;
 static unsigned long tj_buf_size = 0;
+static int tj_quality = JPEG_QUALITY;   /* jpeg.quality, read once at init */
 
 int jpeg_init(void)
 {
+    tj_quality = app_config()->jpeg_quality;
     tj_handle = tjInitCompress();
     if (!tj_handle) {
-        fprintf(stderr, "[jpeg] tjInitCompress failed: %s\n", tjGetErrorStr());
+        LOG_E("tjInitCompress failed: %s", tjGetErrorStr());
         return -1;
     }
     
@@ -26,7 +32,7 @@ int jpeg_init(void)
     tj_buf_size = tjBufSize(IMG_W, IMG_H, TJSAMP_420);
     tj_buf = (unsigned char *)malloc(tj_buf_size);
     if (!tj_buf) {
-        fprintf(stderr, "[jpeg] Failed to allocate %lu bytes\n", tj_buf_size);
+        LOG_E("Failed to allocate %lu bytes", tj_buf_size);
         tjDestroy(tj_handle);
         tj_handle = NULL;
         return -1;
@@ -35,13 +41,13 @@ int jpeg_init(void)
     /* 预分配全局 g_state 的 jpeg_buf */
     g_state.jpeg_buf = (uint8_t *)malloc(tj_buf_size);
     if (!g_state.jpeg_buf) {
-        fprintf(stderr, "[jpeg] Failed to allocate g_state.jpeg_buf\n");
+        LOG_E("Failed to allocate g_state.jpeg_buf");
         free(tj_buf);
         tjDestroy(tj_handle);
         return -1;
     }
 
-    printf("[jpeg] Encoder initialized (TurboJPEG + NEON), buf=%lu bytes\n", tj_buf_size);
+    LOG_I("Encoder initialized (TurboJPEG + NEON), quality=%d, buf=%lu bytes", tj_quality, tj_buf_size);
     return 0;
 }
 
@@ -59,12 +65,12 @@ int jpeg_encode_frame(const uint8_t *rgb_data, unsigned int frame_seq)
         &tj_buf,
         &jpeg_size,
         TJSAMP_420,
-        JPEG_QUALITY,
+        tj_quality,
         TJFLAG_FASTDCT
     );
 
     if (ret < 0) {
-        fprintf(stderr, "[jpeg] Compress error: %s\n", tjGetErrorStr());
+        LOG_E_RL(5.0, 3, "Compress error: %s", tjGetErrorStr());
         return -1;
     }
 

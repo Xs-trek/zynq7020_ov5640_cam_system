@@ -13,6 +13,8 @@ gcc -Wall -Wextra -Werror -std=c11 \
     "${ROOT_DIR}/tests/jpeg_worker_test.c" \
     "${ROOT_DIR}/src/capture/frame_mailbox.c" \
     "${ROOT_DIR}/src/media/jpeg_worker.c" \
+    "${ROOT_DIR}/src/media/stream_rate.c" \
+    "${ROOT_DIR}/src/common/log.c" \
     -lpthread \
     -o "${BIN}"
 

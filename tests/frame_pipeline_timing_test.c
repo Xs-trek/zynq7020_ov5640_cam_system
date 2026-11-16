@@ -14,9 +14,8 @@
 #define PERIOD_US       20000L
 
 app_state_t g_state;
-uint8_t *g_frame_pool[FRAME_BUF_CNT];
+uint8_t *g_frame_pool[CAPTURE_BUF_CNT];
 uint8_t *g_cached_pool[FRAME_BUF_CNT];
-volatile sig_atomic_t g_app_signal_exit_requested;
 
 static uint8_t cached[FRAME_BUF_CNT][FRAME_SIZE];
 static uint8_t source[FRAME_SIZE];
@@ -123,8 +122,8 @@ int main(void)
         memset(&view, 0, sizeof(view));
         view.capture_time_sec = monotonic_sec();
         memset(source, value, sizeof(source));
-        if (frame_mailbox_publish(&g_state, g_cached_pool, source, &view,
-                                  NULL, NULL) != 0)
+        view.frame_seq = frame_mailbox_begin_frame(&g_state);
+        if (frame_mailbox_publish(&g_state, g_cached_pool, source, &view) != 0)
             publish_failures++;
 
         next.tv_nsec += PERIOD_US * 1000L;
